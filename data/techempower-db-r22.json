@@ -1,0 +1,51 @@
+{
+ "id": "techempower-db-r22",
+ "name": "TechEmpower DB 벤치마크 (외부 실측)",
+ "desc": "537개 웹 프레임워크의 DB 조회 엔드포인트를 동시성 16→512로 측정한 실제 데이터. 우리 모델이 예측하는 \"무릎\"이 실제로 나타나는지 확인하는 외부 증거.",
+ "fetchedAt": "2026-08-19",
+ "kind": "latency",
+ "latencyKind": "avg",
+ "points": [
+  {
+   "concurrency": 16,
+   "n": 536,
+   "rps": 22980,
+   "avgMs": 0.74
+  },
+  {
+   "concurrency": 32,
+   "n": 536,
+   "rps": 39939,
+   "avgMs": 0.75
+  },
+  {
+   "concurrency": 64,
+   "n": 536,
+   "rps": 73036,
+   "avgMs": 0.89
+  },
+  {
+   "concurrency": 128,
+   "n": 537,
+   "rps": 79513,
+   "avgMs": 1.5
+  },
+  {
+   "concurrency": 256,
+   "n": 537,
+   "rps": 81408,
+   "avgMs": 3.51
+  },
+  {
+   "concurrency": 512,
+   "n": 535,
+   "rps": 82254,
+   "avgMs": 6.99
+  }
+ ],
+ "kneeRps": 82254,
+ "source": "TechEmpower Framework Benchmarks Round 22 (Continuous Benchmarking Run 2023-10-11 08:00:48), 537개 프레임워크의 중앙값",
+ "license": "TechEmpower (공개 결과)",
+ "url": "https://web.archive.org/web/20240614003708id_/https://tfb-status.techempower.com/raw/results.2023-10-11-01-26-20-787.json",
+ "note": "test=db (요청당 DB 조회 1회). 동시성별 중앙값. 처리량이 82254rps에서 포화되는데 지연은 계속 오른다 — M/M/c의 무릎. Little's Law(동시성 ÷ 처리량) 검산이 측정 지연과 일치해 데이터 자체의 일관성도 확인됨."
+}

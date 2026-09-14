@@ -1,0 +1,429 @@
+{
+ "id": "aws-ec2-seoul",
+ "name": "AWS EC2 가격 (서울)",
+ "desc": "ap-northeast-2 온디맨드 실제 가격·사양. D5 인프라 추천의 앱 서버 카탈로그로 쓴다.",
+ "fetchedAt": "2026-08-19",
+ "kind": "pricing",
+ "tier": "ec2",
+ "region": "ap-northeast-2",
+ "items": [
+  {
+   "type": "t4g.nano",
+   "vcpu": 2,
+   "gb": 0.5,
+   "usdHour": 0.0052
+  },
+  {
+   "type": "t3.nano",
+   "vcpu": 2,
+   "gb": 0.5,
+   "usdHour": 0.0065
+  },
+  {
+   "type": "t4g.micro",
+   "vcpu": 2,
+   "gb": 1,
+   "usdHour": 0.0104
+  },
+  {
+   "type": "t3.micro",
+   "vcpu": 2,
+   "gb": 1,
+   "usdHour": 0.013
+  },
+  {
+   "type": "t4g.small",
+   "vcpu": 2,
+   "gb": 2,
+   "usdHour": 0.0208
+  },
+  {
+   "type": "t3.small",
+   "vcpu": 2,
+   "gb": 2,
+   "usdHour": 0.026
+  },
+  {
+   "type": "t4g.medium",
+   "vcpu": 2,
+   "gb": 4,
+   "usdHour": 0.0416
+  },
+  {
+   "type": "t3.medium",
+   "vcpu": 2,
+   "gb": 4,
+   "usdHour": 0.052
+  },
+  {
+   "type": "t4g.large",
+   "vcpu": 2,
+   "gb": 8,
+   "usdHour": 0.0832
+  },
+  {
+   "type": "c5.large",
+   "vcpu": 2,
+   "gb": 4,
+   "usdHour": 0.096
+  },
+  {
+   "type": "c6i.large",
+   "vcpu": 2,
+   "gb": 4,
+   "usdHour": 0.096
+  },
+  {
+   "type": "c7i.large",
+   "vcpu": 2,
+   "gb": 4,
+   "usdHour": 0.1008
+  },
+  {
+   "type": "t3.large",
+   "vcpu": 2,
+   "gb": 8,
+   "usdHour": 0.104
+  },
+  {
+   "type": "m5.large",
+   "vcpu": 2,
+   "gb": 8,
+   "usdHour": 0.118
+  },
+  {
+   "type": "m6i.large",
+   "vcpu": 2,
+   "gb": 8,
+   "usdHour": 0.118
+  },
+  {
+   "type": "m7i.large",
+   "vcpu": 2,
+   "gb": 8,
+   "usdHour": 0.1239
+  },
+  {
+   "type": "r5.large",
+   "vcpu": 2,
+   "gb": 16,
+   "usdHour": 0.152
+  },
+  {
+   "type": "r6i.large",
+   "vcpu": 2,
+   "gb": 16,
+   "usdHour": 0.152
+  },
+  {
+   "type": "t4g.xlarge",
+   "vcpu": 4,
+   "gb": 16,
+   "usdHour": 0.1664
+  },
+  {
+   "type": "c6i.xlarge",
+   "vcpu": 4,
+   "gb": 8,
+   "usdHour": 0.192
+  },
+  {
+   "type": "c5.xlarge",
+   "vcpu": 4,
+   "gb": 8,
+   "usdHour": 0.192
+  },
+  {
+   "type": "c7i.xlarge",
+   "vcpu": 4,
+   "gb": 8,
+   "usdHour": 0.2016
+  },
+  {
+   "type": "t3.xlarge",
+   "vcpu": 4,
+   "gb": 16,
+   "usdHour": 0.208
+  },
+  {
+   "type": "m6i.xlarge",
+   "vcpu": 4,
+   "gb": 16,
+   "usdHour": 0.236
+  },
+  {
+   "type": "m5.xlarge",
+   "vcpu": 4,
+   "gb": 16,
+   "usdHour": 0.236
+  },
+  {
+   "type": "m7i.xlarge",
+   "vcpu": 4,
+   "gb": 16,
+   "usdHour": 0.2478
+  },
+  {
+   "type": "r5.xlarge",
+   "vcpu": 4,
+   "gb": 32,
+   "usdHour": 0.304
+  },
+  {
+   "type": "r6i.xlarge",
+   "vcpu": 4,
+   "gb": 32,
+   "usdHour": 0.304
+  },
+  {
+   "type": "t4g.2xlarge",
+   "vcpu": 8,
+   "gb": 32,
+   "usdHour": 0.3328
+  },
+  {
+   "type": "c6i.2xlarge",
+   "vcpu": 8,
+   "gb": 16,
+   "usdHour": 0.384
+  },
+  {
+   "type": "c5.2xlarge",
+   "vcpu": 8,
+   "gb": 16,
+   "usdHour": 0.384
+  },
+  {
+   "type": "c7i.2xlarge",
+   "vcpu": 8,
+   "gb": 16,
+   "usdHour": 0.4032
+  },
+  {
+   "type": "t3.2xlarge",
+   "vcpu": 8,
+   "gb": 32,
+   "usdHour": 0.416
+  },
+  {
+   "type": "m5.2xlarge",
+   "vcpu": 8,
+   "gb": 32,
+   "usdHour": 0.472
+  },
+  {
+   "type": "m6i.2xlarge",
+   "vcpu": 8,
+   "gb": 32,
+   "usdHour": 0.472
+  },
+  {
+   "type": "m7i.2xlarge",
+   "vcpu": 8,
+   "gb": 32,
+   "usdHour": 0.4956
+  },
+  {
+   "type": "r6i.2xlarge",
+   "vcpu": 8,
+   "gb": 64,
+   "usdHour": 0.608
+  },
+  {
+   "type": "r5.2xlarge",
+   "vcpu": 8,
+   "gb": 64,
+   "usdHour": 0.608
+  },
+  {
+   "type": "c6i.4xlarge",
+   "vcpu": 16,
+   "gb": 32,
+   "usdHour": 0.768
+  },
+  {
+   "type": "c5.4xlarge",
+   "vcpu": 16,
+   "gb": 32,
+   "usdHour": 0.768
+  },
+  {
+   "type": "c7i.4xlarge",
+   "vcpu": 16,
+   "gb": 32,
+   "usdHour": 0.8064
+  },
+  {
+   "type": "m5.4xlarge",
+   "vcpu": 16,
+   "gb": 64,
+   "usdHour": 0.944
+  },
+  {
+   "type": "m6i.4xlarge",
+   "vcpu": 16,
+   "gb": 64,
+   "usdHour": 0.944
+  },
+  {
+   "type": "m7i.4xlarge",
+   "vcpu": 16,
+   "gb": 64,
+   "usdHour": 0.9912
+  },
+  {
+   "type": "r5.4xlarge",
+   "vcpu": 16,
+   "gb": 128,
+   "usdHour": 1.216
+  },
+  {
+   "type": "r6i.4xlarge",
+   "vcpu": 16,
+   "gb": 128,
+   "usdHour": 1.216
+  },
+  {
+   "type": "c6i.8xlarge",
+   "vcpu": 32,
+   "gb": 64,
+   "usdHour": 1.536
+  },
+  {
+   "type": "c7i.8xlarge",
+   "vcpu": 32,
+   "gb": 64,
+   "usdHour": 1.6128
+  },
+  {
+   "type": "c5.9xlarge",
+   "vcpu": 36,
+   "gb": 72,
+   "usdHour": 1.728
+  },
+  {
+   "type": "m5.8xlarge",
+   "vcpu": 32,
+   "gb": 128,
+   "usdHour": 1.888
+  },
+  {
+   "type": "m6i.8xlarge",
+   "vcpu": 32,
+   "gb": 128,
+   "usdHour": 1.888
+  },
+  {
+   "type": "m7i.8xlarge",
+   "vcpu": 32,
+   "gb": 128,
+   "usdHour": 1.9824
+  },
+  {
+   "type": "c5.12xlarge",
+   "vcpu": 48,
+   "gb": 96,
+   "usdHour": 2.304
+  },
+  {
+   "type": "c6i.12xlarge",
+   "vcpu": 48,
+   "gb": 96,
+   "usdHour": 2.304
+  },
+  {
+   "type": "c7i.12xlarge",
+   "vcpu": 48,
+   "gb": 96,
+   "usdHour": 2.4192
+  },
+  {
+   "type": "r6i.8xlarge",
+   "vcpu": 32,
+   "gb": 256,
+   "usdHour": 2.432
+  },
+  {
+   "type": "r5.8xlarge",
+   "vcpu": 32,
+   "gb": 256,
+   "usdHour": 2.432
+  },
+  {
+   "type": "m5.12xlarge",
+   "vcpu": 48,
+   "gb": 192,
+   "usdHour": 2.832
+  },
+  {
+   "type": "m6i.12xlarge",
+   "vcpu": 48,
+   "gb": 192,
+   "usdHour": 2.832
+  },
+  {
+   "type": "m7i.12xlarge",
+   "vcpu": 48,
+   "gb": 192,
+   "usdHour": 2.9736
+  },
+  {
+   "type": "c6i.16xlarge",
+   "vcpu": 64,
+   "gb": 128,
+   "usdHour": 3.072
+  },
+  {
+   "type": "c7i.16xlarge",
+   "vcpu": 64,
+   "gb": 128,
+   "usdHour": 3.2256
+  },
+  {
+   "type": "r6i.12xlarge",
+   "vcpu": 48,
+   "gb": 384,
+   "usdHour": 3.648
+  },
+  {
+   "type": "r5.12xlarge",
+   "vcpu": 48,
+   "gb": 384,
+   "usdHour": 3.648
+  },
+  {
+   "type": "m6i.16xlarge",
+   "vcpu": 64,
+   "gb": 256,
+   "usdHour": 3.776
+  },
+  {
+   "type": "m5.16xlarge",
+   "vcpu": 64,
+   "gb": 256,
+   "usdHour": 3.776
+  },
+  {
+   "type": "m7i.16xlarge",
+   "vcpu": 64,
+   "gb": 256,
+   "usdHour": 3.9648
+  },
+  {
+   "type": "r5.16xlarge",
+   "vcpu": 64,
+   "gb": 512,
+   "usdHour": 4.864
+  },
+  {
+   "type": "r6i.16xlarge",
+   "vcpu": 64,
+   "gb": 512,
+   "usdHour": 4.864
+  }
+ ],
+ "source": "ec2.shop (AWS 온디맨드 미러)",
+ "license": "공개 API",
+ "url": "https://ec2.shop?region=ap-northeast-2",
+ "note": "온디맨드 시간당 USD. 69종."
+}

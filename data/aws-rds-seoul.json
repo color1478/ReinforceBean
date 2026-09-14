@@ -1,0 +1,339 @@
+{
+ "id": "aws-rds-seoul",
+ "name": "AWS RDS PostgreSQL 가격 (서울)",
+ "desc": "ap-northeast-2 RDS PostgreSQL 온디맨드 실제 가격·사양. D5의 DB 카탈로그. (37MB 다운로드)",
+ "fetchedAt": "2026-08-19",
+ "kind": "pricing",
+ "tier": "rds",
+ "region": "ap-northeast-2",
+ "items": [
+  {
+   "type": "db.t4g.micro",
+   "vcpu": 2,
+   "gb": 1,
+   "usdHour": 0.025
+  },
+  {
+   "type": "db.t3.micro",
+   "vcpu": 2,
+   "gb": 1,
+   "usdHour": 0.028
+  },
+  {
+   "type": "db.t4g.small",
+   "vcpu": 2,
+   "gb": 2,
+   "usdHour": 0.051
+  },
+  {
+   "type": "db.t3.small",
+   "vcpu": 2,
+   "gb": 2,
+   "usdHour": 0.056
+  },
+  {
+   "type": "db.t4g.medium",
+   "vcpu": 2,
+   "gb": 4,
+   "usdHour": 0.102
+  },
+  {
+   "type": "db.t3.medium",
+   "vcpu": 2,
+   "gb": 4,
+   "usdHour": 0.112
+  },
+  {
+   "type": "db.t4g.large",
+   "vcpu": 2,
+   "gb": 8,
+   "usdHour": 0.203
+  },
+  {
+   "type": "db.m6g.large",
+   "vcpu": 2,
+   "gb": 8,
+   "usdHour": 0.221
+  },
+  {
+   "type": "db.t3.large",
+   "vcpu": 2,
+   "gb": 8,
+   "usdHour": 0.224
+  },
+  {
+   "type": "db.m5.large",
+   "vcpu": 2,
+   "gb": 8,
+   "usdHour": 0.247
+  },
+  {
+   "type": "db.m6i.large",
+   "vcpu": 2,
+   "gb": 8,
+   "usdHour": 0.247
+  },
+  {
+   "type": "db.r6g.large",
+   "vcpu": 2,
+   "gb": 16,
+   "usdHour": 0.27
+  },
+  {
+   "type": "db.r5.large",
+   "vcpu": 2,
+   "gb": 16,
+   "usdHour": 0.3
+  },
+  {
+   "type": "db.r6i.large",
+   "vcpu": 2,
+   "gb": 16,
+   "usdHour": 0.3
+  },
+  {
+   "type": "db.t4g.xlarge",
+   "vcpu": 4,
+   "gb": 16,
+   "usdHour": 0.406
+  },
+  {
+   "type": "db.m6g.xlarge",
+   "vcpu": 4,
+   "gb": 16,
+   "usdHour": 0.441
+  },
+  {
+   "type": "db.t3.xlarge",
+   "vcpu": 4,
+   "gb": 16,
+   "usdHour": 0.448
+  },
+  {
+   "type": "db.m5.xlarge",
+   "vcpu": 4,
+   "gb": 16,
+   "usdHour": 0.494
+  },
+  {
+   "type": "db.m6i.xlarge",
+   "vcpu": 4,
+   "gb": 16,
+   "usdHour": 0.494
+  },
+  {
+   "type": "db.r6g.xlarge",
+   "vcpu": 4,
+   "gb": 32,
+   "usdHour": 0.54
+  },
+  {
+   "type": "db.r5.xlarge",
+   "vcpu": 4,
+   "gb": 32,
+   "usdHour": 0.6
+  },
+  {
+   "type": "db.r6i.xlarge",
+   "vcpu": 4,
+   "gb": 32,
+   "usdHour": 0.6
+  },
+  {
+   "type": "db.t4g.2xlarge",
+   "vcpu": 8,
+   "gb": 32,
+   "usdHour": 0.813
+  },
+  {
+   "type": "db.m6g.2xlarge",
+   "vcpu": 8,
+   "gb": 32,
+   "usdHour": 0.883
+  },
+  {
+   "type": "db.t3.2xlarge",
+   "vcpu": 8,
+   "gb": 32,
+   "usdHour": 0.896
+  },
+  {
+   "type": "db.m5.2xlarge",
+   "vcpu": 8,
+   "gb": 32,
+   "usdHour": 0.988
+  },
+  {
+   "type": "db.m6i.2xlarge",
+   "vcpu": 8,
+   "gb": 32,
+   "usdHour": 0.988
+  },
+  {
+   "type": "db.r6g.2xlarge",
+   "vcpu": 8,
+   "gb": 64,
+   "usdHour": 1.079
+  },
+  {
+   "type": "db.r5.2xlarge",
+   "vcpu": 8,
+   "gb": 64,
+   "usdHour": 1.2
+  },
+  {
+   "type": "db.r6i.2xlarge",
+   "vcpu": 8,
+   "gb": 64,
+   "usdHour": 1.2
+  },
+  {
+   "type": "db.m6g.4xlarge",
+   "vcpu": 16,
+   "gb": 64,
+   "usdHour": 1.765
+  },
+  {
+   "type": "db.m5.4xlarge",
+   "vcpu": 16,
+   "gb": 64,
+   "usdHour": 1.976
+  },
+  {
+   "type": "db.m6i.4xlarge",
+   "vcpu": 16,
+   "gb": 64,
+   "usdHour": 1.976
+  },
+  {
+   "type": "db.r6g.4xlarge",
+   "vcpu": 16,
+   "gb": 128,
+   "usdHour": 2.158
+  },
+  {
+   "type": "db.r5.4xlarge",
+   "vcpu": 16,
+   "gb": 128,
+   "usdHour": 2.4
+  },
+  {
+   "type": "db.r6i.4xlarge",
+   "vcpu": 16,
+   "gb": 128,
+   "usdHour": 2.4
+  },
+  {
+   "type": "db.m6g.8xlarge",
+   "vcpu": 32,
+   "gb": 128,
+   "usdHour": 3.53
+  },
+  {
+   "type": "db.m5.8xlarge",
+   "vcpu": 32,
+   "gb": 128,
+   "usdHour": 3.952
+  },
+  {
+   "type": "db.m6i.8xlarge",
+   "vcpu": 32,
+   "gb": 128,
+   "usdHour": 3.952
+  },
+  {
+   "type": "db.r6g.8xlarge",
+   "vcpu": 32,
+   "gb": 256,
+   "usdHour": 4.316
+  },
+  {
+   "type": "db.r5.8xlarge",
+   "vcpu": 32,
+   "gb": 256,
+   "usdHour": 4.8
+  },
+  {
+   "type": "db.r6i.8xlarge",
+   "vcpu": 32,
+   "gb": 256,
+   "usdHour": 4.8
+  },
+  {
+   "type": "db.m6g.12xlarge",
+   "vcpu": 48,
+   "gb": 192,
+   "usdHour": 5.295
+  },
+  {
+   "type": "db.m5.12xlarge",
+   "vcpu": 48,
+   "gb": 192,
+   "usdHour": 5.928
+  },
+  {
+   "type": "db.m6i.12xlarge",
+   "vcpu": 48,
+   "gb": 192,
+   "usdHour": 5.928
+  },
+  {
+   "type": "db.r6g.12xlarge",
+   "vcpu": 48,
+   "gb": 384,
+   "usdHour": 6.474
+  },
+  {
+   "type": "db.m6g.16xlarge",
+   "vcpu": 64,
+   "gb": 256,
+   "usdHour": 7.06
+  },
+  {
+   "type": "db.r5.12xlarge",
+   "vcpu": 48,
+   "gb": 384,
+   "usdHour": 7.2
+  },
+  {
+   "type": "db.r6i.12xlarge",
+   "vcpu": 48,
+   "gb": 384,
+   "usdHour": 7.2
+  },
+  {
+   "type": "db.m5.16xlarge",
+   "vcpu": 64,
+   "gb": 256,
+   "usdHour": 7.904
+  },
+  {
+   "type": "db.m6i.16xlarge",
+   "vcpu": 64,
+   "gb": 256,
+   "usdHour": 7.904
+  },
+  {
+   "type": "db.r6g.16xlarge",
+   "vcpu": 64,
+   "gb": 512,
+   "usdHour": 8.632
+  },
+  {
+   "type": "db.r5.16xlarge",
+   "vcpu": 64,
+   "gb": 512,
+   "usdHour": 9.6
+  },
+  {
+   "type": "db.r6i.16xlarge",
+   "vcpu": 64,
+   "gb": 512,
+   "usdHour": 9.6
+  }
+ ],
+ "source": "instances.vantage.sh (AWS RDS 온디맨드)",
+ "license": "공개 데이터",
+ "url": "https://instances.vantage.sh/rds/instances.json",
+ "note": "PostgreSQL 단일 AZ 온디맨드 시간당 USD. 54종."
+}
