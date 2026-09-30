@@ -1,381 +1,368 @@
 /* app.js — 공동
-   구획 7d~9: 단계 안내·원클릭 예제 · UI 바인딩·메인 루프 · 공개 데이터 로딩
-   engine.js → advisor.js → app.js 순서로 로드된다. 둘 다 쓰는 유일한 파일이므로 변경은 합의 후에. */
+   UI 바인딩 · 메인 루프(인스턴스마다 시뮬 한 벌) · 공개 데이터 로딩
+   engine.js → advisor.js → app.js 순서로 로드된다. */
 'use strict';
+
 /* =====================================================================
- * 7d. 단계 안내 + 원클릭 예제 실행
- *   이 도구는 패널이 많다. "지금 뭘 눌러야 하는가"를 항상 한 줄로 보여주고,
- *   처음 온 사람은 버튼 하나로 전체 흐름을 끝까지 볼 수 있어야 한다.
+ * 8. UI 바인딩
  * ===================================================================== */
-// 각 단계의 완료 판정 — 결과가 실제로 만들어졌는지로 본다 (버튼을 눌렀는지가 아니라)
-let TOUCHED_INPUT = false;
-document.getElementById('left').addEventListener('input', () => { TOUCHED_INPUT = true; }, true);
-document.getElementById('left').addEventListener('change', () => { TOUCHED_INPUT = true; }, true);
-const STEP_DONE = {
-  cond:  () => TOUCHED_INPUT || BASE.mixOn || !!DATA.cur,
-  diag:  () => main.S.history.length > 3,
-  cand:  () => !!LAST_CAND,
-  reco:  () => !!LAST_RECO,
-  cmp:   () => !!LAST_CMP,
-  calib: () => !!CALIB,
-  infra: () => $('infraOut').querySelector('table') != null,
-  save:  () => REPORT_SAVED,
+const bind = (id, key, scale = 1) => {
+  const el = $(id), out = $(id + 'Val');
+  const apply = () => { BASE[key] = +el.value * scale; if (out) out.textContent = el.value; };
+  el.addEventListener('input', apply); apply();
 };
-let REPORT_SAVED = false;
-function markStep() {
-  const btns = [...document.querySelectorAll('#steps .step')];
-  let firstUndone = -1;
-  btns.forEach((b, i) => {
-    const done = !!(STEP_DONE[b.dataset.key] && STEP_DONE[b.dataset.key]());
-    b.classList.toggle('done', done);
-    b.classList.remove('now');
-    if (!done && firstUndone < 0) firstUndone = i;
-  });
-  if (firstUndone >= 0) btns[firstUndone].classList.add('now');
-  // 접힌 패널 제목에도 완료 여부를 표시해 둔다 (열어보지 않아도 알 수 있게)
-  const PANEL_OF = { reco: 'recoOut', cmp: 'cmpOut', calib: 'calibOut', infra: 'infraOut', save: 'reportOut' };
-  for (const key in PANEL_OF) {
-    const el = $(PANEL_OF[key]); if (!el) continue;
-    const h2 = (el.closest('.panel') || el).querySelector('h2'); if (!h2) continue;
-    let tick = h2.querySelector('.tick');
-    const done = !!(STEP_DONE[key] && STEP_DONE[key]());
-    if (done && !tick) { tick = document.createElement('span'); tick.className = 'tick'; tick.textContent = '완료'; h2.insertBefore(tick, h2.lastElementChild); }
-    else if (!done && tick) tick.remove();
+bind('threads', 'threads'); bind('conns', 'conns'); bind('qcap', 'queueCap');
+bind('dbt', 'dbTimeMs'); bind('cpums', 'cpuTimeMs'); bind('to', 'timeoutMs');
+bind('rps', 'rps');
+// 화면에 노출하지 않는 값들 — 시나리오(장애 패턴)와 보정이 필요할 때만 바꾼다
+BASE.retryProb = 0; BASE.cancelOnTimeout = false; BASE.dbScale = 1;
+BASE.dbLoadAlpha = 0; BASE.dbLoadGamma = 2;
+BASE.mixOn = false; BASE.mix = MODEL.mix;
+BASE.cores = null;
+
+/* ── 시나리오 (트래픽 모양) ── */
+const scSel = $('scenario');
+function fillScenarios() {
+  scSel.innerHTML = '';
+  for (const k in SCENARIOS) {
+    if (k.startsWith('curve:') ) continue;
+    const o = document.createElement('option'); o.value = k; o.textContent = SCENARIOS[k].name; scSel.appendChild(o);
   }
-  // 지금 눌러야 할 버튼에 「← 다음」 표시 (한 번에 하나만)
-  const NEXT_BTN = { cand: 'btnCandCmp', reco: 'btnRecommend', cmp: 'btnCompare', calib: 'btnCalib', infra: 'btnInfra', save: 'btnReport' };
-  document.querySelectorAll('button.next').forEach(b => b.classList.remove('next'));
-  if (firstUndone >= 0) { const id = NEXT_BTN[btns[firstUndone].dataset.key]; if (id && $(id)) $(id).classList.add('next'); }
+  for (const d of DATA.list.filter(d => d.kind === 'traffic')) {
+    const o = document.createElement('option'); o.value = 'curve:' + d.id;
+    o.textContent = `실측 곡선: ${d.name}`; scSel.appendChild(o);
+  }
+  scSel.value = scenarioKey;
 }
-// D 열은 전부 펼쳐 둔다 — 열고 닫는 대신 필요한 것이 항상 보이게.
-function openPanel(target) { if (target) target.scrollIntoView({ block: 'nearest' }); }
-const panelOf = (id) => { const el = $(id); return el ? el.closest('.panel') : null; };
-document.querySelectorAll('#steps .step').forEach(b => b.addEventListener('click', () => {
-  const el = $(b.dataset.go); if (!el) return;
-  const box = el.closest('.panel') || el;
-  box.scrollIntoView({ block: 'nearest' });
-  box.classList.remove('flash'); void box.offsetWidth; box.classList.add('flash');
-}));
-openPanel(panelOf('recoOut'));   // 처음엔 ③ 최소 자원을 열어 둔다
-
-// 서버 없이 열어도 예제가 돌아가도록 내장한 실측 결과 (validation/ 에서 잰 값. 파일이 있으면 그쪽을 우선 사용)
-const SAMPLE_CSV = `rps,p50,p95,p99,err_rate,thr
-50,25.0,101.0,144.0,0.0000,55.0
-100,22.0,93.0,147.0,0.0000,103.0
-150,23.0,98.0,143.0,0.0000,155.0
-200,30.0,115.0,170.0,0.0000,196.0
-250,42.0,129.0,176.0,0.0000,250.0
-300,525.0,654.0,715.0,0.1120,266.0
-330,588.0,696.0,753.0,0.2500,249.0
-360,610.0,746.0,814.0,0.3270,242.0
-400,613.0,728.0,791.0,0.3950,242.0`;
-
-async function runDemo() {
-  const log = $('demoLog'), btn = $('btnDemo');
-  btn.disabled = true;
-  const say = (h) => { log.innerHTML = h; };
-  const pause = () => new Promise(r => setTimeout(r, 350));
-  try {
-    // ── 0. 조건: 검증 서버와 같은 설정으로 맞춘다 ──
-    say('<b>0/6</b> 예제 조건을 맞추는 중… (검증 서버와 같은 스레드 50 · 커넥션 10 · DB 30ms)');
-    for (const [id, v] of [['threads', 50], ['conns', 10], ['qcap', 100], ['dbt', 30], ['to', 3000], ['alpha', 0], ['gamma', 2]]) {
-      $(id).value = v; $(id).dispatchEvent(new Event('input'));
-    }
-    if ($('mixOn').checked) { $('mixOn').checked = false; $('mixOn').dispatchEvent(new Event('change')); }
-    TOUCHED_INPUT = true; main.paused = false; markStep();
-    await pause();
-
-    // ── 1. 실측 데이터 ──
-    say('<b>1/6</b> 실측 데이터를 불러오는 중…');
-    let text = SAMPLE_CSV, src = '내장 샘플';
-    try { const r = await fetch('validation/result.csv'); if (r.ok) { text = await r.text(); src = 'validation/result.csv'; } }
-    catch (e) { /* file:// 이면 내장 샘플을 쓴다 */ }
-    VERIFY.real = parseCsv(text);
-    $('verifyMsg').textContent = `실측 ${VERIFY.real.length}점 (${src})`;
-    const knee = VERIFY.real.find(d => d.err > 0.03);
-    say(`<b>1/6</b> 실측 ${VERIFY.real.length}점 로드 (${src}).<br>`
-      + (knee ? `실패가 <b>${knee.rps} rps</b>부터 나기 시작합니다 — 여기가 이 서버의 한계입니다.` : ''));
-    markStep(); await pause();
-
-    // ── 2. 보정 + holdout 검증 ──
-    openPanel(panelOf('calibOut'));
-    const sp = applyAutoSplit(true);
-    say(`<b>2/6</b> 모델 보정 중… <span style="color:var(--muted)">${sp ? sp.fit.join(', ') + ' rps로만 맞추고 나머지 ' + sp.hold.length + '점으로 검증합니다' : ''} (15~25초)</span>`);
-    $('fitAlpha').checked = false;
-    await calibrate();
-    if (CALIB) {
-      const good = CALIB.errAfter < CALIB.errBefore;
-      say(`<b>2/6 완료</b> — 보정에 쓰지 않은 rps에서 오차 <b>${(CALIB.errBefore * 100).toFixed(0)}% → ${(CALIB.errAfter * 100).toFixed(0)}%</b>.<br>`
-        + (good ? '파라미터를 꿰맞춘 게 아니라 <b>모델이 실제로 맞는다</b>는 뜻입니다. ⑤ 패널의 표를 보세요.'
-                : '보정이 오히려 나빠졌습니다 — ⑤ 패널의 경고를 확인하세요.'));
-      applyCalib();
-    }
-    await pause();
-
-    // ── 3. 최소 자원 ──
-    const peak = knee ? Math.round(knee.rps * 0.9 / 10) * 10 : 250;
-    $('sloRps').value = peak; $('sloP95').value = 300;
-    openPanel(panelOf('recoOut'));
-    say(`<b>3/6</b> 피크 <b>${peak} rps</b>에서 목표 p95 300ms를 만족하는 <b>최소 자원</b>을 찾는 중…`);
-    await recommend();
-    say(LAST_RECO
-      ? `<b>3/6 완료</b> — 스레드 <b>${LAST_RECO.t}</b> / 커넥션 <b>${LAST_RECO.c}</b> (p95 ${Math.round(LAST_RECO.p95)}ms).<br>커넥션은 트래픽에 비례해 늘지만 스레드는 훨씬 적게 필요합니다 — 병목이 DB이기 때문입니다.`
-      : `<b>3/6</b> 이 조건에서는 SLO를 만족하는 조합이 없습니다. ④ 비교에서 무엇을 바꿔야 하는지 보세요.`);
-    await pause();
-
-    // ── 4. 설정 후보 비교: 같은 트래픽에서 어느 설정이 나은가 ──
-    $('cmpWrap').classList.remove('flash'); void $('cmpWrap').offsetWidth; $('cmpWrap').classList.add('flash');
-    CAND.list.length = 0; $('btnCandPreset').click();
-    if (LAST_RECO) { CAND.list.push(Object.assign(candFromSliders('D4 추천안'), { threads: LAST_RECO.t, conns: LAST_RECO.c })); renderCandList(); }
-    say(`<b>4/6</b> 같은 트래픽(피크 <b>${peak} rps</b>)에서 <b>설정 후보 ${CAND.list.length}벌</b>이 각각 몇 rps에서 무너지는지 재는 중… (10~20초)`);
-    await compareCands();
-    if (LAST_CAND) {
-      const bc = LAST_CAND.results.filter(r => r.ok).sort((x, y) => x.cost - y.cost)[0];
-      say(`<b>4/6 완료</b> — ` + (bc
-        ? `<b>「${candLabel(bc.c)}」</b>가 피크를 버티는 후보 중 가장 쌉니다 — 과부하 시작 <b>${bc.knee == null ? '스윕 구간 밖' : bc.knee + ' rps'}</b>`
-          + (bc.inf.app && bc.inf.db ? ` · ${bc.inf.app[0]} + ${bc.inf.db[0]} $${Math.round(bc.cost * 730)}/월` : ' · 카탈로그 초과')
-        : '어느 후보도 피크를 버티지 못합니다 — 커넥션이나 쿼리 시간을 손봐야 합니다.')
-        + `<br>오른쪽 아래 <b>C2 차트</b>에 후보별 곡선이 겹쳐 그려집니다 — <b>세로 점선이 각 후보의 과부하 시작점</b>입니다.`);
-    }
-    await pause();
-
-    // ── 5. 개선안 비교 ──
-    openPanel(panelOf('cmpOut'));
-    say(`<b>5/6</b> 같은 조건에서 <b>증설 · 설정 · 쿼리 개선</b>을 비교하는 중… (10~15초)`);
-    await comparePlans();
-    if (LAST_CMP) {
-      const cfgOk = LAST_CMP.rows.filter(r => r.kind === 'cfg' && r.pass).length;
-      const scOk = LAST_CMP.rows.filter(r => r.kind === 'scale' && r.pass).length;
-      say(`<b>5/6 완료</b> — ${LAST_CMP.winner ? `가장 싼 해법은 <b>「${LAST_CMP.winner}」</b>.` : '단일 개선으로는 목표를 못 맞춥니다.'}<br>`
-        + (cfgOk && !scOk ? '설정만 바꿔도 되는 상황입니다 — <b>돈을 쓸 필요가 없습니다.</b>'
-          : !cfgOk && scOk ? '설정으로는 안 되고 <b>증설이 필요한 구간</b>입니다.'
-          : '④ 패널에서 각 안의 <b>다음 병목</b>을 함께 보세요 — 자원을 늘리면 병목은 사라지지 않고 옮겨갑니다.'));
-    }
-    await pause();
-
-    // ── 5. 인프라 + 저장 ──
-    openPanel(panelOf('infraOut'));
-    say('<b>6/6</b> 필요한 EC2 / RDS를 고르는 중…');
-    infraRecommend();
-    say(`<b>완료</b> — 보정 · 후보 비교 · 최소 자원 · 개선안 · 인프라 추천`);
-  } catch (e) {
-    say(`실행 중 문제가 생겼습니다: ${e.message}`);
-  } finally { btn.disabled = false; markStep(); }
+// 시나리오가 직접 정하는 파라미터(재시도 확률·타임아웃·큐)를 슬라이더/BASE 에 1회 반영
+const SLIDER_OF = { threads: 'threads', conns: 'conns', queueCap: 'qcap', dbTimeMs: 'dbt', timeoutMs: 'to', rps: 'rps' };
+function applyScenarioParams(key) {
+  const p = (SCENARIOS[key] || {}).params || {};
+  for (const k in p) {
+    const id = SLIDER_OF[k];
+    if (id && $(id)) { $(id).value = p[k]; $(id).dispatchEvent(new Event('input')); }
+    else BASE[k] = p[k];
+  }
 }
-$('btnDemo').addEventListener('click', runDemo);
+scSel.addEventListener('change', async () => {
+  if (scSel.value.startsWith('curve:')) await useCurve(scSel.value.slice(6));
+  else { scenarioKey = scSel.value; DATA.cur = null; }
+  scenarioStart = CLOCK.t;
+  applyScenarioParams(scenarioKey);
+  // 유입 슬라이더: 수동·실측 곡선에서만 쓸 수 있다 (곡선에서는 '평균 유입' 이 된다)
+  const manual = scenarioKey === 'manual' || scenarioKey.startsWith('curve:');
+  $('ctlRps').classList.toggle('disabled', !manual);
+  $('rpsLbl').textContent = DATA.cur ? '평균 유입' : '유입';
+  showLoadInfo(); resetAll();
+});
+function showLoadInfo() {
+  $('loadInfo').innerHTML = DATA.cur
+    ? `피크/평균 <b>${DATA.cur.peakToMean}배</b> → 피크 <b>${Math.round(BASE.rps * DATA.cur.peakToMean)} rps</b> · ${DATA.cur.points.length}점 · ${DATA.cur.source || ''}`
+    : '';
+}
+$('rps').addEventListener('input', showLoadInfo);
+
+/* ── 재생 ── */
+const PLAY = { paused: false };
+const CLOCK = { t: 0 };
+function resetAll() { CLOCK.t = 0; scenarioStart = 0; for (const it of INST.list) it.sim.reset(); }
+$('btnPause').addEventListener('click', () => { PLAY.paused = !PLAY.paused; $('btnPause').textContent = PLAY.paused ? '재생' : '일시정지'; });
+$('btnReset').addEventListener('click', resetAll);
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && !/INPUT|SELECT|BUTTON/.test(e.target.tagName)) { e.preventDefault(); $('btnPause').click(); }
+});
 
 /* =====================================================================
- * 8. UI 바인딩 + 메인 루프
+ * 8b. 메인 루프 — 인스턴스마다 같은 트래픽을 동시에 먹인다
+ *   인스턴스별로 다른 것은 두 개뿐이다: vCPU(=CPU 슬롯) 와 메모리로 정해지는 스레드 상한.
+ *   나머지 설정·유입·DB 조건은 전부 같게 두어야 "인스턴스 차이"만 남는다.
  * ===================================================================== */
-const main = createSim(MODEL, { visual: false, onSecond: () => updateStats() });
-const bind = (id, key, scale = 1) => { const el = $(id), out = $(id + 'Val');
-  const apply = () => { BASE[key] = +el.value * scale; out.textContent = el.value; }; el.addEventListener('input', apply); apply(); };
-bind('threads', 'threads'); bind('conns', 'conns'); bind('qcap', 'queueCap'); bind('dbt', 'dbTimeMs'); bind('to', 'timeoutMs'); bind('retry', 'retryProb', 0.01);
-bind('alpha', 'dbLoadAlpha'); bind('gamma', 'dbLoadGamma');
-// 슬라이더마다 조절 가능한 범위를 아래에 작게 표시한다 (값만 보고는 여유가 얼마인지 모른다)
-function addRanges(root) {
-  root.querySelectorAll('input[type=range]').forEach(el => {
-    if (el.nextElementSibling && el.nextElementSibling.classList.contains('rng')) return;
-    const d = document.createElement('div'); d.className = 'rng';
-    d.innerHTML = `<span>${el.min}</span><span>${el.max}</span>`;
-    el.parentNode.insertBefore(d, el.nextSibling);
-  });
-}
-addRanges($('left'));
-$('cancel').addEventListener('change', () => { BASE.cancelOnTimeout = $('cancel').checked; }); BASE.cancelOnTimeout = false;
-BASE.dbScale = 1;
-
-/* ── A3 작업 구성: 유형별 비율 × 처리시간 → BASE.mix (엔진이 요청마다 유형을 뽑아 쓴다) ── */
-BASE.mixOn = false;
-BASE.mix = MODEL.mix.map(m => Object.assign({}, m));
-function renderMixRows() {
-  $('mixRows').innerHTML = BASE.mix.map((m, i) => `
-    <div class="mixrow" data-i="${i}">
-      <label>${m.name} <b class="msv">${Math.round(m.share * 100)}%</b></label>
-      <input type="range" class="ms" min="0" max="100" step="5" value="${Math.round(m.share * 100)}">
-      <div class="mtimes">DB <input type="number" class="md" value="${m.dbTimeMs}" min="1" step="5"> ms · 앱 CPU <input type="number" class="mc" value="${m.cpuTimeMs}" min="0" step="1"> ms</div>
-    </div>`).join('');
-  addRanges($('mixRows'));
-  $('mixRows').querySelectorAll('.mixrow').forEach(row => {
-    const i = +row.dataset.i;
-    row.querySelector('.ms').addEventListener('input', (e) => { BASE.mix[i].share = +e.target.value / 100; row.querySelector('.msv').textContent = e.target.value + '%'; syncMix(); });
-    row.querySelector('.md').addEventListener('input', (e) => { BASE.mix[i].dbTimeMs = Math.max(1, +e.target.value || 1); syncMix(); });
-    row.querySelector('.mc').addEventListener('input', (e) => { BASE.mix[i].cpuTimeMs = Math.max(0, +e.target.value || 0); syncMix(); });
-  });
-}
-function syncMix() {
-  const on = BASE.mixOn;
-  $('mixRows').querySelectorAll('.mixrow').forEach(r => r.classList.toggle('off', !on));
-  $('ctlDbt').classList.toggle('disabled', on);
-  if (!on) { $('mixInfo').innerHTML = ''; return; }
-  const tot = BASE.mix.reduce((s, m) => s + m.share, 0);
-  if (tot <= 0) { $('mixInfo').innerHTML = '모든 비율이 0'; return; }
-  const e = effTimes({ mixOn: true, mix: BASE.mix, dbTimeMs: BASE.dbTimeMs, cpuTimeMs: MODEL.cpuTimeMs, dbScale: 1 });
-  const shares = BASE.mix.filter(m => m.share > 0).map(m => `${m.name} ${Math.round(m.share / tot * 100)}%`).join(' · ');
-  const loadTot = BASE.mix.reduce((s, m) => s + m.share * m.dbTimeMs, 0);
-  const heavy = BASE.mix.map(m => ({ m, load: m.share * m.dbTimeMs })).sort((a, b) => b.load - a.load)[0];
-  $('mixInfo').innerHTML = `실효 DB <b>${e.db.toFixed(1)}ms</b> · 이론 최대 <b>${Math.round(BASE.conns / e.db * 1000)} rps</b>`
-    + ` · 「${heavy.m.name}」이 DB 시간의 ${Math.round(heavy.load / loadTot * 100)}%`;
-}
-$('mixOn').addEventListener('change', () => { BASE.mixOn = $('mixOn').checked; syncMix(); });
-document.querySelectorAll('[data-mix]').forEach(b => b.addEventListener('click', () => {
-  const parts = b.dataset.mix.split(':').map(Number);
-  BASE.mix.forEach((m, i) => { m.share = (parts[i] || 0) / 100; });
-  if (!BASE.mixOn) { BASE.mixOn = true; $('mixOn').checked = true; }
-  renderMixRows(); syncMix();
-}));
-renderMixRows(); syncMix();
-const rpsEl = $('rps'); const applyRps = () => { BASE.rps = +rpsEl.value; $('rpsVal').textContent = rpsEl.value; }; rpsEl.addEventListener('input', applyRps); applyRps();
-const scSel = $('scenario'); for (const k in SCENARIOS) { const o = document.createElement('option'); o.value = k; o.textContent = SCENARIOS[k].name; scSel.appendChild(o); }
-const SLIDER_OF = { threads: ['threads', 1], conns: ['conns', 1], queueCap: ['qcap', 1], dbTimeMs: ['dbt', 1], timeoutMs: ['to', 1], retryProb: ['retry', 100], rps: ['rps', 1] };
-scSel.addEventListener('change', () => {
-  scenarioKey = scSel.value; scenarioStart = main.S.t; $('ctlRps').classList.toggle('disabled', scenarioKey !== 'manual');
-  const p = SCENARIOS[scenarioKey].params || {};   // 시나리오 초기 파라미터를 슬라이더에 1회 반영 (이후 사용자가 바꿀 수 있음)
-  for (const k in p) { const [id, mul] = SLIDER_OF[k]; $(id).value = p[k] * mul; $(id).dispatchEvent(new Event('input')); }
-  renderExplain(0);
-});
-// 간결 모드가 기본. 설정은 브라우저에 기억된다
-$('prose').checked = localStorage.getItem('reinforcebean.prose') === '1';
-const syncProse = () => { document.body.classList.toggle('lean', !$('prose').checked); localStorage.setItem('reinforcebean.prose', $('prose').checked ? '1' : '0'); };
-$('prose').addEventListener('change', syncProse); syncProse();
-$('btnPause').addEventListener('click', () => { main.paused = !main.paused; $('btnPause').textContent = main.paused ? '재생' : '일시정지'; });
-$('btnReset').addEventListener('click', () => { main.reset(); scenarioStart = 0; PB_KEY = ''; updateStats(); });
-document.querySelectorAll('[data-preset]').forEach(b => b.addEventListener('click', () => {
-  const p = b.dataset.preset; if (p === 'baseline') { $('threads').value = 50; $('conns').value = 10; } if (p === 'moreThreads') $('threads').value = 200; if (p === 'moreConns') $('conns').value = 30;
-  $('threads').dispatchEvent(new Event('input')); $('conns').dispatchEvent(new Event('input')); }));
-document.addEventListener('keydown', (e) => { if (e.code === 'Space' && !/INPUT|SELECT|BUTTON/.test(e.target.tagName)) { e.preventDefault(); $('btnPause').click(); } });
-
-// 재생 바 — 지금 시나리오의 어느 국면인지. 마커는 해설 단계(explain)의 시각.
-let PB_KEY = '';
-function drawPlaybar() {
-  const sc = SCENARIOS[scenarioKey];
-  const span = sc.period || Math.max(30, (sc.explain[sc.explain.length - 1].t || 0) + 20);
-  const tt = ((main.S.t - scenarioStart) / 1000) % span;
-  if (PB_KEY !== scenarioKey) {                      // 시나리오가 바뀔 때만 마커를 다시 그린다
-    PB_KEY = scenarioKey; $('scName').textContent = sc.name;
-    $('scMarks').innerHTML = sc.explain.map(e => `<i style="left:${Math.min(100, (e.t || 0) / span * 100)}%" title="${e.text.replace(/<[^>]+>/g, '').slice(0, 40)}"></i>`).join('');
+function syncInstModels() {
+  for (const it of INST.list) {
+    Object.assign(it.M, MODEL);
+    it.M.cores = it.vcpu;
+    it.M.threads = Math.min(BASE.threads, it.threadCap);
+    it.M.label = it.type;
+    it.M.baseline = it.baseline;        // 버스터블 기준선 — 흐름도 vCPU 칸에 점선으로 깔린다
   }
-  $('scFill').style.width = (tt / span * 100).toFixed(1) + '%';
-  $('scPos').textContent = `${tt.toFixed(0)}s / ${span}s`;
 }
-
-let lastExplainIdx = -1;
-function renderExplain(tt) {
-  if (!$('explain')) return;
-  const sc = SCENARIOS[scenarioKey]; let idx = 0; sc.explain.forEach((s, i) => { if (tt >= s.t) idx = i; });
-  if (idx === lastExplainIdx && $('explain').dataset.sc === scenarioKey) return;
-  lastExplainIdx = idx; $('explain').dataset.sc = scenarioKey;
-  $('explain').innerHTML = sc.explain.map((s, i) => `<div class="step${i === idx ? ' now' : ''}">${sc.period || s.t ? `<b>${s.t}s</b> · ` : ''}${s.text}</div>`).join('') +
-    (sc.period ? `<div class="note">${sc.period}초 주기로 반복</div>` : '');
-  const now = $('explain').querySelector('.now'); if (now) now.scrollIntoView({ block: 'nearest' });
+function scenarioMarks() {
+  const sc = SCENARIOS[scenarioKey], out = [];
+  if (!sc || !sc.period || !sc.explain) return out;
+  const base = scenarioStart / 1000, tEnd = CLOCK.t / 1000;
+  for (let k = 0; k < 200 && base + k * sc.period <= tEnd; k++)
+    for (const st of sc.explain) { const t = base + k * sc.period + st.t; if (t <= tEnd) out.push({ t, text: st.text }); }
+  return out;
 }
 function updateStats() {
-  const S = main.S, h = S.history[S.history.length - 1], th = theory(MODEL);
+  const it = instSel();
   const put = (id, v) => { const el = $(id); if (el) el.textContent = v; };
-  if (h) { put('mThr', h.out); put('mP95', Math.round(h.p95)); put('mP99', Math.round(h.p99 || 0));
-    put('mThU', Math.round(h.thU * 100)); put('mCoU', Math.round(h.coU * 100));
-    put('mErr', h.rej + h.to); put('mRetry', `${h.retry} / ${h.wasted}`); put('tWqM', (h.avgWait / (h.out || 1) * 1000).toFixed(0) + ' ms'); }
-  // 작업 유형별 p95 — 평균 하나로는 "어떤 작업이 먼저 SLO를 깨는가"가 안 보인다
-  const cs = $('clsStats');
-  if (MODEL.mixOn && h && h.cls) {
-    const sloP95 = +$('sloP95').value;
-    const rows = h.cls.map((c, i) => MODEL.mix[i] && MODEL.mix[i].share > 0
-      ? `<tr><td>${c.name}</td><td>${Math.round(MODEL.mix[i].share * 100)}%</td><td>${c.done}/s</td><td style="color:${c.p95 > sloP95 ? 'var(--red)' : 'var(--ink)'};font-weight:${c.p95 > sloP95 ? 700 : 400}">${c.p95 ? Math.round(c.p95) + ' ms' : '–'}</td></tr>` : '').join('');
-    cs.innerHTML = `<div class="note" style="margin:8px 0 4px">작업 유형별 (목표 p95 ${sloP95}ms)</div><table class="t"><tr><th>작업</th><th>비율</th><th>완료</th><th>p95</th></tr>${rows}</table>`;
-  } else cs.innerHTML = '';
-  put('tRhoT', th.rhoT.toFixed(2)); put('tRhoD', th.rhoD.toFixed(2));
-  put('tDbEff', th.dbEffMs.toFixed(1) + ' ms');
-  put('tCap', th.cap.toFixed(0)); put('tWq', isFinite(th.wq) ? th.wq.toFixed(0) + ' ms' : '∞');
-  const b = detectBottleneck(S, MODEL), el = $('bottleneck'); el.dataset.level = b.level; el.querySelector('.t').textContent = b.title;
+  $('bnWho').textContent = it ? it.type : '';
+  if (!it) { $('bottleneck').dataset.level = 'ok'; $('bottleneck').querySelector('.t').textContent = '인스턴스 없음'; return; }
+  const S = it.sim.S, M = it.M, h = S.history[S.history.length - 1], th = theory(M);
+  if (h) { put('mThr', h.out); put('mP95', Math.round(h.p95)); put('mErr', h.rej + h.to); }
+  put('tCap', th.cap.toFixed(0));
+  const b = detectBottleneck(S, M), el = $('bottleneck');
+  el.dataset.level = b.level;
+  el.querySelector('.t').textContent = b.title;
+  el.querySelector('.d').innerHTML = b.desc || '';
 }
-let last = performance.now(), acc = 0;
+let last = performance.now(), acc = 0, lastSec = -1;
 function frame(now) {
-  let real = Math.min(100, now - last); last = now;
-  if (!main.paused) {
-    const tt = applyScenario(main);
-    if (scenarioKey !== 'manual') { $('rpsVal').textContent = MODEL.rps; rpsEl.value = MODEL.rps; }
-    renderExplain(tt);
-    acc += real; while (acc >= MODEL.dt) { main.step(MODEL.dt); acc -= MODEL.dt; }
+  const real = Math.min(100, now - last); last = now;
+  if (!PLAY.paused) {
+    applyScenario({ S: { t: CLOCK.t } });                  // BASE → MODEL, 시나리오가 덮어쓴다
+    if (scenarioKey !== 'manual' && !DATA.cur) { $('rps').value = MODEL.rps; $('rpsVal').textContent = MODEL.rps; }
+    syncInstModels();
+    acc += real;
+    while (acc >= MODEL.dt) { for (const it of INST.list) it.sim.step(MODEL.dt); CLOCK.t += MODEL.dt; acc -= MODEL.dt; }
   }
-  $('simClock').textContent = (main.S.t / 1000).toFixed(1) + 's';
-  drawPlaybar();
-  drawStage(main); drawTimeline(main); drawVerify();
+  $('simClock').textContent = (CLOCK.t / 1000).toFixed(1) + 's';
+  const sel = instSel();
+  if (sel) drawStage(sel.sim);
+  drawCompare(INST.list.map(it => Object.assign({ sel: it === sel }, it)),
+    { win: MODEL.historySec, p95: +$('sloP95').value, marks: scenarioMarks() });
+  const sec = Math.floor(CLOCK.t / 1000);
+  // 표는 1초에 한 번만 다시 그린다 (좌우 두 리스트 + 추천)
+  if (sec !== lastSec) { lastSec = sec; updateStats(); renderAdvice(); renderInstTable(); renderCfgTable(); }
   requestAnimationFrame(frame);
 }
+
 /* =====================================================================
- * 9. 공개 실측 데이터 — data/ 의 실제 트래픽 곡선을 시나리오로 재생
- *   validation/fetch_public.js 가 Wikimedia 등에서 받아 정규화해 둔 파일을 읽는다.
- *   절대 요청량이 아니라 *모양*(상대값 0~1)을 쓰고, 사용자가 정한 평균 유입으로 스케일한다.
+ * 9. 공개 데이터 — EC2 실가격 카탈로그 + 실제 트래픽 곡선
+ *   validation/fetch_public.js 가 받아 정규화해 둔 data/ 를 읽는다.
+ *   트래픽은 절대량이 아니라 *모양*(0~1)만 쓰고, 유입 슬라이더(평균)로 스케일한다.
  * ===================================================================== */
 const DATA = { list: [], cur: null };
-async function loadDatasetIndex() {
+async function loadData() {
   try {
-    const list = await (await fetch('data/index.json')).json();
-    DATA.list = list;
-    const sel = $('dataset');
-    for (const d of list.filter(d => d.kind === 'traffic')) { const o = document.createElement('option'); o.value = d.id; o.textContent = `${d.name} (peak/평균 ${d.peakToMean}배)`; sel.appendChild(o); }
-    // 가격표: 있으면 D5 카탈로그 교체
+    DATA.list = await (await fetch('data/index.json')).json();
     const loaded = [];
-    for (const meta of list.filter(d => d.kind === 'pricing')) {
+    for (const meta of DATA.list.filter(d => d.kind === 'pricing' && d.tier === 'ec2')) {
       const p = await (await fetch('data/' + meta.file)).json();
-      PRICE[p.tier] = p.items.map(i => [i.type, i.vcpu, i.gb, i.usdHour]).sort((a, b) => a[3] - b[3]);
-      loaded.push(`${p.tier.toUpperCase()} ${p.items.length}종`);
+      PRICE.ec2 = p.items.map(i => [i.type, i.vcpu, i.gb, i.usdHour]).sort((a, b) => a[3] - b[3]);
+      loaded.push(`EC2 ${p.items.length}종`);
     }
     if (loaded.length) PRICE.src = `${loaded.join(' · ')} — ap-northeast-2 실가격 (fetch_public.js)`;
-    // 외부 지연 곡선: C2 검증 차트에 참고선으로
-    const lat = list.find(d => d.kind === 'latency');
-    if (lat) {
-      const p = await (await fetch('data/' + lat.file)).json();
-      VERIFY.ext = p;
-      // rps 규모가 우리와 자릿수가 달라 C2에 겹치지 않는다. 대신 "무릎이 실제로 관측된다"는 외부 증거로 D3에 싣는다.
-      const pts = p.points, a = pts[pts.length - 3], b = pts[pts.length - 1];
-      if ($('extEvidence')) $('extEvidence').innerHTML = `<b>외부 실측 증거</b> — ${p.source}<br>`
-        + `동시성 ${a.concurrency}→${b.concurrency} 에서 처리량은 ${fmt(a.rps)}→${fmt(b.rps)} rps (<b>+${Math.round((b.rps / a.rps - 1) * 100)}%</b>) 로 포화인데, `
-        + `평균 지연은 ${a.avgMs}→${b.avgMs} ms (<b>${(b.avgMs / a.avgMs).toFixed(1)}배</b>). `
-        + `자원을 더 밀어넣어도 처리량은 늘지 않고 지연만 오르는 ρ→1 무릎이 실제 측정에서도 그대로 나타난다.`;
-    }
-    $('dsInfo').innerHTML = `공개 데이터 ${list.length}개` + (loaded.length ? ` · 실가격 ${loaded.join(' / ')}` : '');
+    refreshCatalog();
+    fillScenarios();
   } catch (e) {
-    $('dsInfo').innerHTML = `데이터 없음 — <code>node validation/fetch_public.js</code> 실행 후 <code>python -m http.server</code> 로 열어야 합니다.`;
+    $('loadInfo').innerHTML = `공개 데이터 없음 — <code>python -m http.server</code> 로 열면 실가격·실측 곡선을 씁니다`;
   }
 }
-async function selectDataset(id) {
-  if (!id) { DATA.cur = null; CMP.ref = null; if (scenarioKey === 'realtraffic') { scenarioKey = 'manual'; $('scenario').value = 'manual'; } return; }
-  const meta = DATA.list.find(d => d.id === id);
+async function useCurve(id) {
+  const meta = DATA.list.find(d => d.id === id); if (!meta) return;
   const d = await (await fetch('data/' + meta.file)).json();
   DATA.cur = d;
-  // 24시간(또는 일주일)을 화면 시간으로 압축: 점 하나당 5초
-  const span = d.points.length * 5;
-  SCENARIOS.realtraffic = {
-    name: '' + d.name, period: span, params: {},
-    at: (t) => { const i = Math.min(d.points.length - 1, Math.floor(t / 5)), nx = Math.min(d.points.length - 1, i + 1), f = (t / 5) - i;
+  const span = d.points.length * 5;   // 점 하나당 5초로 압축 재생
+  const key = 'curve:' + id;
+  SCENARIOS[key] = {
+    name: d.name, period: span, params: {},
+    at: (t) => {
+      const i = Math.min(d.points.length - 1, Math.floor(t / 5)), nx = Math.min(d.points.length - 1, i + 1), f = (t / 5) - i;
       const rel = d.points[i].rel * (1 - f) + d.points[nx].rel * f;
-      return { rps: Math.round(rel * DATA.peak) }; },
-    explain: [
-      { t: 0, text: `<b>${d.name}</b> — ${d.note || ''}` },
-      { t: 5, text: `실제 관측된 트래픽 모양이다. 피크는 평균의 <b>${d.peakToMean}배</b>. 용량은 평균이 아니라 <b>피크</b>에 맞춰야 한다.` },
-      { t: Math.round(span * .4), text: '피크 구간 — 여기서 실패가 나면 그 설정은 부적합. D4에서 이 피크로 최소 자원을 찾을 것.' },
-      { t: Math.round(span * .75), text: `저점 구간 — 피크에 맞춘 자원은 이 시간 동안 놀고 있다. 이것이 용량 계획의 비용이다 (이용률 ${Math.round(100 / d.peakToMean)}%).` },
-    ],
-    dataset: d,
+      return { rps: Math.round(rel * BASE.rps * d.peakToMean) };   // 슬라이더 = 평균 유입
+    },
+    explain: [{ t: Math.round(span * .4), text: '피크' }, { t: Math.round(span * .75), text: '저점' }],
   };
-  applyAvgRps();
-  $('scenario').value = 'realtraffic';
-  if (![...$('scenario').options].some(o => o.value === 'realtraffic')) { const o = document.createElement('option'); o.value = 'realtraffic'; o.textContent = SCENARIOS.realtraffic.name; $('scenario').appendChild(o); }
-  else [...$('scenario').options].find(o => o.value === 'realtraffic').textContent = SCENARIOS.realtraffic.name;
-  $('scenario').value = 'realtraffic';
-  scenarioKey = 'realtraffic'; scenarioStart = main.S.t; $('ctlRps').classList.add('disabled'); renderExplain(0);
-  $('dsInfo').innerHTML = `<b>${d.name}</b> · 피크/평균 ${d.peakToMean}배 → <b>피크 ${DATA.peak} rps</b><br><span class="hint">${d.points.length}점 · 출처 ${d.source} · ③의 피크 유입에 자동 입력됨</span>`;
+  scenarioKey = key;
 }
-function applyAvgRps() {
-  const avg = +$('avgRps').value; $('avgRpsVal').textContent = avg;
-  if (!DATA.cur) return;
-  DATA.peak = Math.round(avg * DATA.cur.peakToMean);
-  $('sloRps').value = DATA.peak;                        // D4 피크 입력에 반영
-  CMP.ref = { name: DATA.cur.name.slice(0, 12), p50: 0, peak: DATA.peak, avg };
-}
-$('dataset').addEventListener('change', (e) => selectDataset(e.target.value));
-$('avgRps').addEventListener('input', () => { applyAvgRps(); if (DATA.cur) $('dsInfo').innerHTML = `<b>${DATA.cur.name}</b> · 피크/평균 ${DATA.cur.peakToMean}배 → <b>피크 ${DATA.peak} rps</b>`; });
-loadDatasetIndex();
 
-renderExplain(0); updateStats(); markStep(); setInterval(markStep, 2000); requestAnimationFrame(frame);
+/* =====================================================================
+ * 10. 설정 시나리오 — 서버 설정 한 벌을 표로 저장해 두고, 돌려보기 전에 결과를 미리 본다
+ *   저장하는 것: 슬라이더 값 한 벌 + 트래픽 시나리오 키. (localStorage)
+ *   미리보기   : 그 설정으로 헤드리스 20초를 돌려 p95·처리량·실패율을 먼저 본다.
+ *                재생 중인 화면은 건드리지 않는다 — 불러오기를 눌러야 실제로 적용된다.
+ * ===================================================================== */
+const CFG_KEY = 'reinforcebean.cfgs.v1';
+const CFG_FIELDS = [
+  { k: 'rps',       id: 'rps',     label: '유입',    unit: 'rps' },
+  { k: 'threads',   id: 'threads', label: '스레드',  unit: '' },
+  { k: 'conns',     id: 'conns',   label: '커넥션',  unit: '' },
+  { k: 'queueCap',  id: 'qcap',    label: '큐',      unit: '' },
+  { k: 'dbTimeMs',  id: 'dbt',     label: 'DB',      unit: 'ms' },
+  { k: 'cpuTimeMs', id: 'cpums',   label: 'CPU',     unit: 'ms' },
+  { k: 'timeoutMs', id: 'to',      label: '타임아웃', unit: 'ms' },
+];
+const CFG_SEED = [
+  { name: '기본 — 스레드 50 · 커넥션 20', scenario: 'manual',
+    cfg: { rps: 250, threads: 50, conns: 20, queueCap: 100, dbTimeMs: 30, cpuTimeMs: 8, timeoutMs: 3000, retryProb: 0 } },
+  { name: '커넥션 10 — 풀이 먼저 막힌다', scenario: 'manual',
+    cfg: { rps: 250, threads: 50, conns: 10, queueCap: 100, dbTimeMs: 30, cpuTimeMs: 8, timeoutMs: 3000, retryProb: 0 } },
+  { name: '큐 400 · 타임아웃 10s — 에러 없이 느려진다', scenario: 'hiddenq',
+    cfg: { rps: 360, threads: 50, conns: 20, queueCap: 400, dbTimeMs: 30, cpuTimeMs: 8, timeoutMs: 10000, retryProb: 0 } },
+  { name: '재시도 90% · 타임아웃 1s — 폭풍 조건', scenario: 'retrystorm',
+    cfg: { rps: 300, threads: 50, conns: 20, queueCap: 400, dbTimeMs: 30, cpuTimeMs: 8, timeoutMs: 1000, retryProb: 0.9 } },
+];
+const CFGS = { list: [], prev: new Map(), filter: 'all' };   // prev: "행id|인스턴스" → 미리보기 결과 (인스턴스가 바뀌면 다시 잰다)
+
+function curCfg() {
+  const o = {}; for (const f of CFG_FIELDS) o[f.k] = BASE[f.k];
+  o.retryProb = BASE.retryProb || 0; return o;
+}
+function cfgStoreLoad() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(CFG_KEY)); } catch (e) { saved = null; }
+  CFGS.list = Array.isArray(saved) && saved.length ? saved
+    : CFG_SEED.map((s, i) => ({ id: 'seed' + i, name: s.name, scenario: s.scenario, cfg: Object.assign({}, s.cfg) }));
+  cfgStoreSave();
+}
+function cfgStoreSave() { try { localStorage.setItem(CFG_KEY, JSON.stringify(CFGS.list)); } catch (e) {} }
+
+// 미리보기: 저장된 유입으로 정상 부하 20초(워밍업 6초). 시나리오의 시간 변화(스파이크 등)는 빼고
+// 같은 조건에서 행끼리 견주기 위한 값이다 — 인스턴스는 지금 선택한 한 대를 기준으로 한다.
+function cfgPreview(row) {
+  const it = instSel();
+  const c = Object.assign({}, row.cfg, {
+    cores: it ? it.vcpu : null,
+    threads: it ? Math.min(row.cfg.threads, it.threadCap) : row.cfg.threads,
+    retryProb: row.cfg.retryProb || 0, dbScale: 1, cancelOnTimeout: false, mixOn: false,
+  });
+  const r = runHeadless(c, 20, 6), th = theory(Object.assign({}, MODEL, c));
+  return { p95: r.p95, thr: r.thr, err: r.errRate, bottle: th.bottle, cap: th.cap };
+}
+const cfgKeyOf = (row) => row.id + '|' + (instSel() ? instSel().type : '-');
+
+function renderCfgTable() {
+  const it = instSel(), cur = curCfg(), p95T = +$('sloP95').value, errT = +$('sloErr').value / 100;
+  $('cfgBasis').textContent = it ? `기준 ${it.type} (${it.vcpu} vCPU)` : '인스턴스 없음';
+  const BN = { cpu: 'vCPU', db: 'DB 커넥션', thread: '스레드/큐' };
+  // 한 행이 후보 하나. 설정도 결과도 전부 인셀 차트 — 셀이 칠해진 길이가 그 값의 크기다.
+  //   설정 칸 : 슬라이더 최댓값 대비 (지금 설정과 다르면 진하게)
+  //   결과 칸 : 목표치 대비 (넘으면 빨갛게) + 「기준(지금 설정)」 대비 증감률
+  const SHOW = CFG_FIELDS.concat([{ k: 'retryProb', label: '재시도', unit: '%', max: 1, pct: true }]);
+  const slider = (f) => f.max != null ? f.max : (($(f.id) && +$(f.id).max) || 100);
+  const pv0 = CFGS.prev.get('now|' + (it ? it.type : '-'));       // 기준 행의 예측 — 증감률의 분모
+  const W = (frac) => `<i class="fill" style="width:${Math.round(Math.max(0, Math.min(1, frac)) * 100)}%"></i>`;
+  const dlt = (v, base, lowerBetter) => {
+    if (base == null || !isFinite(base) || base <= 0 || v == null) return '';
+    const d = Math.round((v - base) / base * 100);
+    if (Math.abs(d) < 1) return ' <em>=</em>';
+    const good = lowerBetter ? d < 0 : d > 0;
+    return ` <em class="${good ? 'dn' : 'up'}">${d > 0 ? '+' : ''}${d}%</em>`;
+  };
+  const head = '<tr><th class="l">후보 · 트래픽</th>'
+    + SHOW.map(f => `<th>${f.label}</th>`).join('')
+    + '<th class="sep">예상 p95</th><th>처리량</th><th>실패</th><th class="l">병목</th><th>판정</th><th></th></tr>';
+
+  const nowRow = { id: 'now', name: '지금 설정', scenario: scenarioKey, cfg: cur };
+  const shown = CFGS.list.filter(r => {
+    if (CFGS.filter === 'all') return true;
+    const pv = CFGS.prev.get(cfgKeyOf(r));
+    if (!pv) return false;
+    return (pv.p95 <= p95T && pv.err <= errT) === (CFGS.filter === 'ok');
+  });
+  // 인셀 차트의 눈금은 「보이는 후보들 중 최댓값」 — 후보끼리 길이로 바로 견주려면 열 안에서 정규화해야 한다
+  const all = [nowRow].concat(shown);
+  const colMax = {};
+  for (const f of SHOW) colMax[f.k] = Math.max(1e-9, ...all.map(r => r.cfg[f.k] || 0));
+  const thrMax = Math.max(1, ...all.map(r => {
+    const pv = r.id === 'now' ? pv0 : CFGS.prev.get(cfgKeyOf(r)); return pv ? pv.thr : 0;
+  }));
+
+  const line = (row, isNow) => {
+    const c = row.cfg, pv = isNow ? pv0 : CFGS.prev.get(cfgKeyOf(row));
+    const ok = pv ? (pv.p95 <= p95T && pv.err <= errT) : null;
+    // ── 설정 셀 ──
+    const cells = SHOW.map(f => {
+      const v = c[f.k] == null ? 0 : c[f.k], d = !isNow && v !== (cur[f.k] || 0);
+      const txt = f.pct ? (v ? Math.round(v * 100) + '%' : '—') : v + (f.unit || '');
+      return `<td class="cell${d ? ' d' : ''}${v ? '' : ' zero'}"`
+        + ` title="${f.label} ${txt} · 후보 중 최대 ${f.pct ? Math.round(colMax[f.k] * 100) + '%' : colMax[f.k] + (f.unit || '')}`
+        + ` · 슬라이더 최대 ${f.pct ? '100%' : slider(f) + (f.unit || '')}">`
+        + W(v / colMax[f.k] * 0.92) + `<b>${txt}</b></td>`;
+    }).join('');
+    // ── 결과 셀 ──
+    const pvc = pv
+      ? `<td class="cell sep ${pv.p95 > p95T ? 'hot' : ''}" title="목표 ${p95T}ms">${W(pv.p95 / Math.max(1, p95T))}`
+        + `<b>${Math.round(pv.p95)} ms</b>${isNow ? '' : dlt(pv.p95, pv0 && pv0.p95, true)}</td>`
+        + `<td class="cell" title="이론 최대 ${pv.cap.toFixed(0)}rps">${W(pv.thr / thrMax * 0.92)}`
+        + `<b>${pv.thr.toFixed(0)} rps</b>${isNow ? '' : dlt(pv.thr, pv0 && pv0.thr, false)}</td>`
+        + `<td class="cell ${pv.err > errT ? 'hot' : pv.err > 0 ? 'warm' : 'zero'}" title="허용 ${(errT * 100).toFixed(1)}%">`
+        + `${W(Math.min(1, pv.err) / Math.max(.001, errT))}<b>${(Math.min(1, pv.err) * 100).toFixed(1)} %</b></td>`
+        + `<td class="l">${BN[pv.bottle]}</td>`
+        + `<td><span class="pill ${ok ? 'ok' : 'no'}">${ok ? '만족' : '미달'}</span></td>`
+      : '<td class="sep">—</td><td>—</td><td>—</td><td class="l" style="color:var(--muted)">미리보기 전</td><td>—</td>';
+    const sc = SCENARIOS[row.scenario] ? SCENARIOS[row.scenario].name : (row.scenario || '수동');
+    const act = isNow
+      ? `<div class="act"><button data-pv="now">예측</button></div>`
+      : `<div class="act"><button data-pv="${row.id}" title="이 설정으로 20초 돌려 본 예측">예측</button>`
+        + `<button class="primary" data-load="${row.id}" title="슬라이더·트래픽 시나리오를 이 설정으로">적용</button>`
+        + `<button data-del="${row.id}" title="삭제">✕</button></div>`;
+    return `<tr class="${isNow ? 'now' : ''}" data-ok="${ok === null ? '' : ok ? 'ok' : 'no'}">`
+      + `<td class="l name">${isNow ? '▸ 기준 (지금 설정)' : esc(row.name)}`
+      + ` <span style="color:var(--muted);font-weight:400">${esc(sc)}</span></td>`
+      + `${cells}${pvc}<td>${act}</td></tr>`;
+  };
+
+  const nCol = 1 + SHOW.length + 6;
+  $('cfgTable').innerHTML = `<thead>${head}</thead><tbody>`
+    + line(nowRow, true) + shown.map(r => line(r, false)).join('')
+    + (shown.length ? '' : `<tr><td colspan="${nCol}" class="l" style="color:var(--muted)">`
+        + (CFGS.list.length ? '이 조건에 맞는 후보가 없다 — 「전부 미리보기」로 예측을 먼저 채운다'
+                            : '저장된 후보가 없다 — 왼쪽 슬라이더를 맞춘 뒤 「＋ 저장」') + '</td></tr>')
+    + '</tbody>';
+}
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function cfgSaveCurrent() {
+  const c = curCfg();
+  const name = ($('cfgName') && $('cfgName').value.trim())
+    || `${c.rps}rps · 스레드 ${c.threads} · 커넥션 ${c.conns}`;
+  CFGS.list.push({ id: 'c' + Date.now().toString(36), name, scenario: scenarioKey, cfg: c });
+  cfgStoreSave();
+  if ($('cfgName')) $('cfgName').value = '';
+  renderCfgTable();
+}
+// 불러오기: 트래픽 시나리오를 먼저 바꾸고(시나리오 기본값이 슬라이더를 덮으므로) 그 위에 저장값을 얹는다
+function cfgApply(row) {
+  const key = SCENARIOS[row.scenario] ? row.scenario : 'manual';
+  if (key !== scenarioKey || key === 'manual') { scSel.value = key; scSel.dispatchEvent(new Event('change')); }
+  for (const f of CFG_FIELDS) {
+    const el = $(f.id), v = row.cfg[f.k];
+    if (el && v != null) { el.value = v; el.dispatchEvent(new Event('input')); }
+  }
+  BASE.retryProb = row.cfg.retryProb || 0;
+  showLoadInfo(); resetAll(); renderCfgTable();
+}
+
+/* ── 표 안의 버튼 (미리보기 · 적용 · 삭제) ── */
+$('cfgSave').addEventListener('click', cfgSaveCurrent);
+$('cfgSave2').addEventListener('click', cfgSaveCurrent);
+document.querySelectorAll('.fbtn').forEach(b => b.addEventListener('click', () => {
+  CFGS.filter = b.dataset.filter;
+  document.querySelectorAll('.fbtn').forEach(x => x.classList.toggle('on', x === b));
+  renderCfgTable();
+}));
+$('cfgTable').addEventListener('click', (e) => {
+  const btn = e.target.closest('button'); if (!btn) return;
+  if (btn.dataset.del) { CFGS.list = CFGS.list.filter(r => r.id !== btn.dataset.del); cfgStoreSave(); renderCfgTable(); }
+  else if (btn.dataset.load) { const r = CFGS.list.find(x => x.id === btn.dataset.load); if (r) cfgApply(r); }
+  else if (btn.dataset.pv) {
+    const id = btn.dataset.pv;
+    const row = id === 'now' ? { id: 'now', cfg: curCfg() } : CFGS.list.find(x => x.id === id);
+    if (!row) return;
+    btn.textContent = '…';
+    setTimeout(() => { CFGS.prev.set(cfgKeyOf(row), cfgPreview(row)); renderCfgTable(); }, 20);
+  }
+});
+// 전부 미리보기: 한 행씩 끊어서 돈다 (재생 중인 화면이 멈춰 보이지 않게)
+$('cfgPreviewAll').addEventListener('click', () => {
+  const rows = [{ id: 'now', cfg: curCfg() }].concat(CFGS.list);
+  let i = 0;
+  const next = () => {
+    if (i >= rows.length) { renderCfgTable(); return; }
+    const row = rows[i++];
+    CFGS.prev.set(cfgKeyOf(row), cfgPreview(row));
+    renderCfgTable(); setTimeout(next, 15);
+  };
+  next();
+});
+
+/* ── 시작 ── */
+fillScenarios();
+loadData().then(() => { if (!INST.list.length) $('instPreset').click(); });
+$('instPreset').click();
+cfgStoreLoad();
+updateStats(); showLoadInfo(); renderAdvice(); renderInstTable(); renderCfgTable();
+requestAnimationFrame(frame);

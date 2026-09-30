@@ -1,13 +1,17 @@
 /* engine.js — 파트 1 · 진단
    구획 1~5: 모델 · 시뮬레이션 엔진 · 이론값/병목 판정 · 시나리오 · 렌더링
-   밖으로 내보내는 계약: runHeadless(cfg, sec, warmup) · theory(cfg) · MODEL/BASE · SCENARIOS
-   advisor.js 는 이것만 쓴다. 반환 모양만 지키면 엔진 내부는 자유롭게 바꿔도 된다. */
+   밖으로 내보내는 계약: createSim(M) · runHeadless(cfg, sec, warmup) · theory(cfg) · MODEL/BASE
+                        · SCENARIOS/applyScenario · drawStage(sim) · drawCompare(list, opts)
+   반환 모양만 지키면 엔진 내부는 자유롭게 바꿔도 된다. */
 'use strict';
 /* =====================================================================
  * 1. MODEL — 모델 파라미터 (UI에 바인딩되는 메인 인스턴스용)
  * ===================================================================== */
 const MODEL = {
   cpuTimeMs: 5, dbTimeMs: 30, queueCap: 100, timeoutMs: 3000, threads: 50, conns: 10, rps: 100,
+  // 앱 서버의 vCPU 개수. null 이면 CPU 무제한(예전 동작). EC2 인스턴스 비교가 인스턴스마다 이 값을 바꿔 넣는다 —
+  // 같은 설정·같은 트래픽에서 "CPU 할당이 몇 개인가"만 달라졌을 때 무엇이 변하는지가 이 도구의 주 화면이다.
+  cores: null,
   retryProb: 0,          // 실패(타임아웃·거절) 시 클라이언트가 재시도할 확률
   retryDelayMs: 200,
   cancelOnTimeout: false, // true면 클라이언트 타임아웃 시 서버도 즉시 작업 취소. false(현실 기본)면 서버는 아무도 안 기다리는 요청을 끝까지 처리(고아 요청 = 낭비)
@@ -49,9 +53,10 @@ function effTimes(M) {
 }
 
 /* =====================================================================
- * 2. createSim() — 시뮬레이션 엔진 (다중 인스턴스 가능: 메인 화면 + 추천 탐색 + 검증 스윕)
- *   요청 생애: spawn → queued → waitconn → db → cpu → done
+ * 2. createSim() — 시뮬레이션 엔진 (동시에 여러 벌: 인스턴스마다 한 벌 + 보정용 헤드리스)
+ *   요청 생애: spawn → queued → waitconn → db → waitcpu → cpu → done
  *                       ↘ rejected(큐 포화)   ↘ timeout(대기 초과) → (확률) 재시도 유입
+ *   슬롯 자원 세 개: 스레드(threads) · DB 커넥션(conns) · vCPU(cores)
  * ===================================================================== */
 function poisson(lambda) {
   if (lambda <= 0) return 0;
@@ -67,14 +72,16 @@ function pct(arr, p) { if (!arr.length) return 0; const a = arr.slice().sort((x,
 function createSim(M, opts = {}) {
   const visual = !!opts.visual;
   const S = {
-    M, t: 0, reqs: [], fx: [], retryQ: [], nextId: 1, usedThreads: 0, usedConns: 0, lastSec: 0, history: [],
+    M, t: 0, reqs: [], fx: [], retryQ: [], nextId: 1, usedThreads: 0, usedConns: 0, usedCores: 0, lastSec: 0, history: [],
     win: null, onSecond: opts.onSecond || null,
   };
   const nCls = (M.mix && M.mix.length) || 0;
   const newWin = () => ({ done: 0, rej: 0, to: 0, retry: 0, wasted: 0, dbSum: 0, dbN: 0, lat: [],
     brk: { q: 0, wc: 0, db: 0, cpu: 0 },   // 완료 요청의 단계별 체류시간 합 (ms) — 지연 분해용
+    pass: { thread: 0, conn: 0, cpu: 0 },  // 이 구간을 실제로 통과한 건수 — 흐름도의 띠 두께
+    lost: { q: 0, wc: 0, run: 0 },         // 클라이언트가 포기한 지점 (큐 / 커넥션 대기 / 처리 중)
     cls: Array.from({ length: nCls }, () => ({ done: 0, lat: [] })),   // 작업 유형별 완료·지연
-    thBusy: 0, coBusy: 0, ticks: 0, waitSum: 0, spawned: 0 });
+    thBusy: 0, coBusy: 0, cpBusy: 0, ticks: 0, waitSum: 0, spawned: 0 });
   S.win = newWin();
 
   // ── 작업 유형 샘플링: 비율(share)대로 요청 하나의 종류를 정한다. mixOn=false면 -1(단일 평균 작업) ──
@@ -93,11 +100,12 @@ function createSim(M, opts = {}) {
 
   function spawn(retry) {
     return { id: S.nextId++, state: 'queued', tSpawn: S.t, tState: S.t, tDone: 0, retry: !!retry, abandoned: false, cls: pickClass(),
-             tq: 0, twc: 0, tdb: 0, x: -20, y: 0, tx: 0, ty: 0, thrSlot: null, dbSlot: null };
+             tq: 0, twc: 0, tdb: 0, tcw: 0, x: -20, y: 0, tx: 0, ty: 0, thrSlot: null, dbSlot: null };
   }
   function finish(r, state) {
-    if (r.state === 'waitconn' || r.state === 'db' || r.state === 'cpu') S.usedThreads--;
+    if (r.state === 'waitconn' || r.state === 'db' || r.state === 'waitcpu' || r.state === 'cpu') S.usedThreads--;
     if (r.state === 'db') S.usedConns--;
+    if (r.state === 'cpu') S.usedCores--;
     r.state = state; r.tEnd = S.t;
     if (state === 'done') { if (r.abandoned) { S.win.wasted++; r.state = 'wasted'; } else { const tot = S.t - r.tSpawn; S.win.done++; S.win.lat.push(tot);
       const b = S.win.brk; b.q += r.tq; b.wc += r.twc; b.db += r.tdb; b.cpu += Math.max(0, tot - r.tq - r.twc - r.tdb);
@@ -108,7 +116,11 @@ function createSim(M, opts = {}) {
   }
   function clientFail() { if (Math.random() < M.retryProb) S.retryQ.push(S.t + M.retryDelayMs); }   // 타임아웃·거절(503) 모두 재시도 대상
   // 클라이언트가 포기하는 순간: 클라이언트 관점 실패 확정. 서버는 (취소 전파가 없으면) 계속 처리한다
-  function abandon(r) { r.abandoned = true; S.win.to++; clientFail(); if (M.cancelOnTimeout) { finish(r, 'timeout'); return true; } return false; }
+  function abandon(r) {
+    r.abandoned = true; S.win.to++;
+    S.win.lost[r.state === 'queued' ? 'q' : r.state === 'waitconn' ? 'wc' : 'run']++;   // 어디서 포기당했나
+    clientFail(); if (M.cancelOnTimeout) { finish(r, 'timeout'); return true; } return false;
+  }
   function enqueue(r, queued) {
     S.win.spawned++;
     if (queued >= M.queueCap) { finish(r, 'rejected'); return false; }
@@ -127,18 +139,23 @@ function createSim(M, opts = {}) {
       const age = S.t - r.tSpawn;
       if (!r.abandoned && age > M.timeoutMs && r.state !== 'cpu' && abandon(r)) continue;
       if (r.state === 'queued') {
-        if (S.usedThreads < M.threads) { S.usedThreads++; r.tq = S.t - r.tState; r.state = 'waitconn'; r.tState = S.t; }
+        if (S.usedThreads < M.threads) { S.usedThreads++; S.win.pass.thread++; r.tq = S.t - r.tState; r.state = 'waitconn'; r.tState = S.t; }
       }
       if (r.state === 'waitconn') {
-        if (S.usedConns < M.conns) { S.usedConns++; r.twc = S.t - r.tState; r.state = 'db'; r.tState = S.t; r.tDone = S.t + expo(dbEff(r)); }
+        if (S.usedConns < M.conns) { S.usedConns++; S.win.pass.conn++; r.twc = S.t - r.tState; r.state = 'db'; r.tState = S.t; r.tDone = S.t + expo(dbEff(r)); }
       }
-      if (r.state === 'db' && S.t >= r.tDone) { S.usedConns--; r.tdb = S.t - r.tState; S.win.dbSum += r.tdb; S.win.dbN++; r.state = 'cpu'; r.tState = S.t; r.tDone = S.t + cpuBase(r); }
+      if (r.state === 'db' && S.t >= r.tDone) { S.usedConns--; r.tdb = S.t - r.tState; S.win.dbSum += r.tdb; S.win.dbN++; r.state = 'waitcpu'; r.tState = S.t; }
+      // vCPU 슬롯: 코어가 전부 차 있으면 스레드를 쥔 채로 CPU를 기다린다 (작은 인스턴스에서 여기가 병목이 된다)
+      if (r.state === 'waitcpu' && (M.cores == null || S.usedCores < M.cores)) {
+        S.usedCores++; S.win.pass.cpu++; r.tcw = S.t - r.tState; r.state = 'cpu'; r.tState = S.t; r.tDone = S.t + cpuBase(r);
+      }
       if (r.state === 'cpu' && S.t >= r.tDone) { finish(r, 'done'); continue; }
       alive.push(r);
     }
     S.reqs = alive;
     // (c) 집계
     const w = S.win; w.ticks++; w.thBusy += S.usedThreads / M.threads; w.coBusy += S.usedConns / M.conns;
+    w.cpBusy += M.cores ? Math.min(1, S.usedCores / M.cores) : 0;
     let waiting = 0; for (const r of S.reqs) if (r.state === 'queued' || r.state === 'waitconn') waiting++;
     w.waitSum += waiting;
     const sec = Math.floor(S.t / 1000);
@@ -146,11 +163,14 @@ function createSim(M, opts = {}) {
   }
   function roll() {
     const w = S.win, k = Math.max(1, w.ticks);
-    let q = 0, wc = 0; for (const r of S.reqs) { if (r.state === 'queued') q++; else if (r.state === 'waitconn') wc++; }
+    let q = 0, wc = 0, cw = 0; for (const r of S.reqs) { if (r.state === 'queued') q++; else if (r.state === 'waitconn') wc++; else if (r.state === 'waitcpu') cw++; }
     const n = Math.max(1, w.done);
     const h = { t: S.t / 1000, in: w.spawned, out: w.done, rej: w.rej, to: w.to, retry: w.retry, wasted: w.wasted, dbMean: w.dbN ? w.dbSum / w.dbN : 0,
       brk: { q: w.brk.q / n, wc: w.brk.wc / n, db: w.brk.db / n, cpu: w.brk.cpu / n },
-      p50: pct(w.lat, .5), p95: pct(w.lat, .95), p99: pct(w.lat, .99), lat: w.lat, thU: w.thBusy / k, coU: w.coBusy / k, q, wc, avgWait: w.waitSum / k,
+      pass: { thread: w.pass.thread, conn: w.pass.conn, cpu: w.pass.cpu },
+      lost: { q: w.lost.q, wc: w.lost.wc, run: w.lost.run },
+      p50: pct(w.lat, .5), p95: pct(w.lat, .95), p99: pct(w.lat, .99), lat: w.lat,
+      thU: w.thBusy / k, coU: w.coBusy / k, cpU: w.cpBusy / k, q, wc, cw, avgWait: w.waitSum / k,
       // 작업 유형별: 같은 서버인데 어떤 작업이 먼저 SLO를 깨는지 보려면 유형별 p95를 따로 봐야 한다
       cls: w.cls.map((c, i) => ({ name: (M.mix && M.mix[i]) ? M.mix[i].name : '', done: c.done, p50: pct(c.lat, .5), p95: pct(c.lat, .95) })),
       clsLat: w.cls.map(c => c.lat),
@@ -159,7 +179,7 @@ function createSim(M, opts = {}) {
     S.win = newWin();
     if (S.onSecond) S.onSecond(h);
   }
-  function reset() { S.t = 0; S.reqs = []; S.fx = []; S.retryQ = []; S.usedThreads = 0; S.usedConns = 0; S.history = []; S.lastSec = 0; S.win = newWin(); }
+  function reset() { S.t = 0; S.reqs = []; S.fx = []; S.retryQ = []; S.usedThreads = 0; S.usedConns = 0; S.usedCores = 0; S.history = []; S.lastSec = 0; S.win = newWin(); }
   return { S, step, reset };
 }
 
@@ -169,16 +189,16 @@ function runHeadless(cfg, durationSec, warmupSec) {
   const sim = createSim(M);
   const lat = []; let inN = 0, done = 0, rej = 0, to = 0; const B = { q: 0, wc: 0, db: 0, cpu: 0 }; let bn = 0;
   const nC = (M.mixOn && M.mix) ? M.mix.length : 0, CL = Array.from({ length: nC }, () => []);
-  let thU = 0, coU = 0, qSum = 0, samples = 0;
+  let thU = 0, coU = 0, cpU = 0, qSum = 0, samples = 0;
   sim.S.onSecond = (h) => { if (h.t > warmupSec) { lat.push(...h.lat); inN += h.in; done += h.out; rej += h.rej; to += h.to;
-    thU += h.thU; coU += h.coU; qSum += h.q; samples++;
+    thU += h.thU; coU += h.coU; cpU += h.cpU || 0; qSum += h.q; samples++;
     for (let i = 0; i < nC; i++) if (h.clsLat && h.clsLat[i]) CL[i].push(...h.clsLat[i]);
     if (h.out) { for (const k in B) B[k] += h.brk[k] * h.out; bn += h.out; } } };
   for (let i = 0; i < durationSec * 1000 / M.dt; i++) sim.step(M.dt);
   const secs = durationSec - warmupSec, k = Math.max(1, samples);
   if (bn) for (const key in B) B[key] /= bn;
   return { p50: pct(lat, .5), p95: pct(lat, .95), p99: pct(lat, .99), errRate: inN ? (rej + to) / inN : 0,
-    thr: done / secs, inRate: inN / secs, brk: B, thU: thU / k, coU: coU / k, qAvg: qSum / k,
+    thr: done / secs, inRate: inN / secs, brk: B, thU: thU / k, coU: coU / k, cpU: cpU / k, qAvg: qSum / k,
     cls: CL.map((a, i) => ({ name: M.mix[i].name, n: a.length, p50: pct(a, .5), p95: pct(a, .95) })) };
 }
 
@@ -195,14 +215,19 @@ function theory(M) {
   for (let i = 0; i < 8; i++) dbT = e.db * (1 + alpha * Math.pow(Math.min(1, lam * dbT / M.conns), gamma));
   const muT = 1 / (dbT + e.cpu), muD = 1 / dbT;
   const rhoT = lam / (M.threads * muT), rhoD = lam / (M.conns * muD);
-  const capT = M.threads * muT * 1000, capD = M.conns * muD * 1000, cap = Math.min(capT, capD);
+  const capT = M.threads * muT * 1000, capD = M.conns * muD * 1000;
+  // vCPU: 코어 하나가 초당 1000ms 의 CPU 시간을 준다 → 요청당 CPU 시간으로 나누면 코어당 처리 가능 rps
+  const cores = M.cores || 0, useCpu = cores > 0 && e.cpu > 0;
+  const rhoC = useCpu ? lam * e.cpu / cores : 0, capC = useCpu ? cores / e.cpu * 1000 : Infinity;
+  const cap = Math.min(capT, capD, capC);
+  const bottle = rhoC >= rhoD && rhoC >= rhoT ? 'cpu' : rhoD >= rhoT ? 'db' : 'thread';
   const dbBottle = rhoD >= rhoT, c = dbBottle ? M.conns : M.threads, mu = dbBottle ? muD : muT, rho = dbBottle ? rhoD : rhoT;
   let wq = Infinity; if (rho < 1) wq = erlangC(c, lam / mu) / (c * mu - lam);
-  return { rhoT, rhoD, cap, capT, capD, wq, dbBottle, dbEffMs: dbT, dbNomMs: e.db, cpuEffMs: e.cpu };
+  return { rhoT, rhoD, rhoC, cap, capT, capD, capC, wq, dbBottle, bottle, dbEffMs: dbT, dbNomMs: e.db, cpuEffMs: e.cpu };
 }
 function detectBottleneck(S, M) {
   const h = S.history[S.history.length - 1]; if (!h) return { level: 'ok', title: '정상', desc: '데이터 수집 중' };
-  const th = theory(M), errRate = (h.rej + h.to) / Math.max(1, h.in), rhoMax = Math.max(th.rhoT, th.rhoD);
+  const th = theory(M), errRate = (h.rej + h.to) / Math.max(1, h.in), rhoMax = Math.max(th.rhoT, th.rhoD, th.rhoC);
   const retryShare = h.retry / Math.max(1, h.in);
   const nomDb = effTimes(Object.assign({}, BASE, { dbScale: 1 })).db;   // 설정상 기대되는 DB 시간 (작업 구성 가중평균)
   // 관측된 DB 처리시간(완료 요청의 db 구간 평균)이 기준의 1.8배 이상 + 커넥션 포화 = 슬로우 쿼리
@@ -220,6 +245,8 @@ function detectBottleneck(S, M) {
     return { level: 'bad', title: '큐 지연 축적 (숨은 장애)', desc: `실패율 ${(errRate * 100).toFixed(1)}%로 대시보드는 초록인데 p95 ${Math.round(h.p95)}ms, 큐 ${h.q}/${M.queueCap}. 큐가 크면 "안 죽는" 대신 모두가 느려진다 — 에러율만 보는 알람은 이걸 놓친다. 큐를 줄이고 빨리 실패시키는 편이 낫다 (병목: ${th.dbBottle ? 'DB 커넥션' : '스레드'})` };
   if (retryShare > 0.25 && h.coU > 0.85)
     return { level: 'bad', title: '재시도 폭풍 (metastable)', desc: `유입의 ${(retryShare * 100).toFixed(0)}%가 재시도, 서버 작업 중 ${h.wasted}/s는 이미 포기한 클라이언트를 위한 낭비. 부하가 줄어도 재시도가 자리를 채워 스스로 회복하지 못한다 — 재시도 backoff/서킷브레이커, 취소 전파, 또는 유입 차단이 필요` };
+  if (M.cores && h.cpU > 0.9 && (h.cw || 0) >= 1)
+    return { level: 'bad', title: `CPU 포화 — vCPU ${M.cores}개 부족`, desc: `코어 ${M.cores}개가 계속 100%. 요청 ${h.cw}건이 DB를 끝내고도 CPU를 기다린다. 이론상 이 코어 수로는 ${Math.round(th.capC)}rps가 한계 (유입 ${M.rps}rps) — 커넥션·스레드를 늘려도 나아지지 않는다. 더 큰 인스턴스(vCPU↑) 또는 요청당 CPU 시간 감소가 답이다` };
   if (h.coU > 0.9 && h.wc >= Math.max(3, M.threads * 0.2))
     return { level: 'bad', title: 'DB 커넥션 병목', desc: `스레드 ${h.wc}개가 커넥션을 못 얻어 놀고 있음. 스레드를 늘려도 나아지지 않는다 — 커넥션 풀을 늘리거나 DB 처리시간을 줄일 것 (ρ_db=${th.rhoD.toFixed(2)})` };
   if (h.thU > 0.9 && h.q > 0)
@@ -235,41 +262,24 @@ function detectBottleneck(S, M) {
  * 4. 시나리오 — 정상 부하 + 장애 패턴 (유입 곡선, 파라미터 덮어쓰기, 단계별 해설)
  * ===================================================================== */
 const SCENARIOS = {
-  manual: { name: '수동 (슬라이더)', at: () => ({ rps: null }),
-    explain: [{ t: 0, text: '슬라이더로 직접 실험. README 시연: 300rps → 더 올림 → 스레드 200(무효) → 커넥션 30(회복)' }] },
-  steady: { name: '정상 부하 (80 rps)', at: () => ({ rps: 80 }),
-    explain: [{ t: 0, text: 'ρ≈0.25. 대기 없이 흐른다. 이 상태의 스레드/커넥션 이용률을 기억해 두자.' }] },
-  spike: { name: '스파이크 (100 → 400 rps)', period: 40, at: (t) => ({ rps: t > 15 && t < 25 ? 400 : 100 }),
-    explain: [{ t: 0, text: '평시 100rps.' }, { t: 15, text: '<b>400rps 스파이크</b> — 커넥션(최대 333rps)이 먼저 막힌다. 스레드가 주황색으로 변한다.' },
-      { t: 25, text: '스파이크 종료. 큐에 쌓인 요청이 빠지며 회복. 타임아웃(3s)보다 큐 소진이 빠르면 손실은 일부에 그친다.' }] },
-  ramp: { name: '점증 (0 → 600 rps)', period: 80, at: (t) => ({ rps: t < 60 ? Math.round(t / 60 * 600) : 0 }),
-    explain: [{ t: 0, text: '유입을 선형으로 올린다. 응답시간은 <b>선형으로 오르지 않는다</b>.' },
-      { t: 25, text: 'ρ≈0.75 부근(250rps)부터 p95가 꺾이기 시작.' }, { t: 33, text: 'ρ→1 (333rps). 대기시간 폭발. 이게 M/M/c의 핵심 직관.' }, { t: 60, text: '유입 0. 잔여 큐 소진.' }] },
-  // ── 장애 패턴 ──
-  slowq: { name: '장애: 슬로우 쿼리', period: 60, params: { rps: 150 },
-    at: (t) => ({ rps: 150, dbScale: t > 15 && t < 40 ? 5 : 1 }),   // 모든 작업 유형의 DB 시간을 5배로 (작업 구성을 켜도 동작)
-    explain: [{ t: 0, text: '150rps, ρ_db≈0.45. 여유롭다.' },
-      { t: 15, text: '<b>DB 처리시간 30 → 150ms</b> (인덱스 깨짐, 락 경합, 느린 디스크…). 유입은 그대로인데 커넥션이 100% 찬다.' },
-      { t: 20, text: '스레드가 주황색으로 — 앱 서버 지표(CPU, 스레드)는 멀쩡해 보여서 <b>앱을 의심하기 쉽다</b>. 병목 판정기는 "부하 대비 설명 안 되는 커넥션 포화"로 슬로우 쿼리를 짚는다.' },
-      { t: 40, text: 'DB 회복. 커넥션 풀을 늘렸다면 DB에 더 많은 느린 쿼리를 밀어넣어 더 악화됐을 수 있다.' }] },
-  retrystorm: { name: '장애: 재시도 폭풍', period: 70, params: { retryProb: 0.9, timeoutMs: 1000, queueCap: 400 },
+  manual:     { name: '수동 (슬라이더)',        at: () => ({ rps: null }), explain: [{ t: 0, text: '수동' }] },
+  steady:     { name: '정상 부하 80 rps',        at: () => ({ rps: 80 }),   explain: [{ t: 0, text: '정상' }] },
+  spike:      { name: '스파이크 100 → 400 rps', period: 40, at: (t) => ({ rps: t > 15 && t < 25 ? 400 : 100 }),
+    explain: [{ t: 15, text: '스파이크 400rps' }, { t: 25, text: '회복' }] },
+  ramp:       { name: '점증 0 → 600 rps',       period: 80, at: (t) => ({ rps: t < 60 ? Math.round(t / 60 * 600) : 0 }),
+    explain: [{ t: 33, text: 'ρ→1 (333rps)' }, { t: 60, text: '유입 0' }] },
+  slowq:      { name: '장애: 슬로우 쿼리',       period: 60, params: { rps: 150 },
+    at: (t) => ({ rps: 150, dbScale: t > 15 && t < 40 ? 5 : 1 }),
+    explain: [{ t: 15, text: 'DB 시간 ×5' }, { t: 40, text: 'DB 회복' }] },
+  retrystorm: { name: '장애: 재시도 폭풍',       period: 70, params: { retryProb: 0.9, timeoutMs: 1000, queueCap: 400 },
     at: (t) => ({ rps: t > 15 && t < 25 ? 450 : 300 }),
-    explain: [{ t: 0, text: '300rps (ρ≈0.9), 큐 400, 타임아웃 1s, 클라이언트는 실패 시 90% 재시도. 평시엔 문제없다.' },
-      { t: 15, text: '<b>450rps 스파이크</b> 10초. 큐가 차서 대기가 1s를 넘고 타임아웃 시작 → 재시도가 유입에 더해진다.' },
-      { t: 20, text: '보라색 = <b>낭비</b>: 클라이언트는 이미 포기했는데 서버는 그 요청을 계속 처리 중(취소 전파 없음). 서버 용량 전부가 아무도 안 기다리는 일에 쓰인다.' },
-      { t: 25, text: '스파이크가 끝나 300rps로 돌아왔는데도 <b>처리량 0</b>. 큐는 고아 요청으로 차 있고, 새 요청은 전부 타임아웃 → 또 재시도. 스스로 절대 회복하지 못한다 (metastable failure).' },
-      { t: 40, text: '해법 실험: ① 「취소 전파」 체크 → 낭비가 사라지며 회복. ② 재시도 확률 0(=backoff/서킷브레이커) → 회복. ③ 큐를 100으로 줄이면 애초에 타임아웃 대신 즉시 거절되어 폭풍이 안 생긴다(fail fast).' }] },
-  herd: { name: '장애: Thundering herd', period: 50, params: { queueCap: 100 },
+    explain: [{ t: 15, text: '스파이크 450rps' }, { t: 25, text: '유입 복귀 (회복 안 됨)' }] },
+  herd:       { name: '장애: Thundering herd',  period: 50, params: { queueCap: 100 },
     at: (t) => ({ rps: t < 10 ? 150 : t < 18 ? 0 : t < 24 ? 700 : 150 }),
-    explain: [{ t: 0, text: '평시 150rps.' }, { t: 10, text: '<b>서버 재시작/배포</b> — 8초간 유입 0. 그동안 클라이언트 요청이 바깥에 쌓인다.' },
-      { t: 18, text: '복구 순간 <b>700rps</b>가 몰린다. 큐(100)가 즉시 넘쳐 거절이 쏟아지고, 잡힌 요청도 대기 끝에 타임아웃.' },
-      { t: 24, text: '유입이 평시로 돌아와도 큐 잔량 때문에 몇 초 더 느리다. 해법: 워밍업 중 점진 유입(램프), 큐를 짧게 유지해 빨리 실패.' }] },
-  hiddenq: { name: '장애: 큐 지연 축적', period: 60, params: { queueCap: 1000, timeoutMs: 10000 },
+    explain: [{ t: 10, text: '재시작 (유입 0)' }, { t: 18, text: '복구 순간 700rps' }, { t: 24, text: '평시 복귀' }] },
+  hiddenq:    { name: '장애: 큐 지연 축적',      period: 60, params: { queueCap: 1000, timeoutMs: 10000 },
     at: (t) => ({ rps: t > 10 && t < 40 ? 360 : 200 }),
-    explain: [{ t: 0, text: '"큐를 크게, 타임아웃을 길게" — 안 죽게 만들었다고 믿는 설정. 큐 1000, 타임아웃 10s.' },
-      { t: 10, text: '용량을 살짝 넘는 <b>360rps</b>. 에러율은 거의 0. 대시보드는 초록색.' },
-      { t: 25, text: '하지만 p95가 수 초로 치솟는다. 사용자는 이미 떠났고, <b>에러율만 보는 알람은 울리지 않는다</b>. 이게 숨은 장애.' },
-      { t: 40, text: '유입이 줄어도 큐를 다 비울 때까지 느리다. 해법: 큐를 짧게 + 타임아웃 짧게 → 빨리 실패하고 빨리 회복(fail fast).' }] },
+    explain: [{ t: 10, text: '360rps (에러 없이 느려짐)' }, { t: 40, text: '유입 감소' }] },
 };
 let scenarioKey = 'manual', scenarioStart = 0;
 function applyScenario(sim) {
@@ -284,12 +294,11 @@ function applyScenario(sim) {
 
 
 /* =====================================================================
- * 5. 렌더링 — 단면도 + 타임라인 + 검증 차트
+ * 5. 렌더링 — 인스턴스 한 대의 단면도 + 인스턴스 실시간 비교 차트
  * ===================================================================== */
 const $ = (id) => document.getElementById(id);
 const stage = $('stage'), sctx = stage.getContext('2d');
-const tl = $('timeline'), tctx = tl.getContext('2d');
-const vf = $('verify'), vctx = vf.getContext('2d');
+const cmpc = $('cmp'), cctx = cmpc.getContext('2d');
 const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const COL = {};
 (function () { for (const k of ['idle','queued','busy','waitconn','db','done','timeout','retry']) COL[k] = css('--c-' + k);
@@ -303,309 +312,326 @@ function fitCanvas(c) {
 }
 function roundRect(c, x, y, w, h, r) { r = Math.min(r, w / 2, h / 2); c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r); c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath(); }
 // ── B 과부하 진단 ──────────────────────────────────────────────────────
-//  자원마다 성질이 다르므로 그림도 다르게 쓴다.
-//   스레드 · 커넥션 = 정해진 슬롯을 몇 개 쓰는가  → 도트 매트릭스
-//   대기 큐        = 쌓이고 있는가                → 스파크라인(면적)
-//   요청 수지      = 유입이 어디로 갈라졌는가      → 분기 흐름(생키)
-//   지연           = 한 건의 시간이 어디서 나갔나  → 100% 띠 한 줄
-const CMP = { ref: null, reco: null };
+//  자원을 칸칸이 따로 보여주는 대신, 요청 한 줄기가 지나가는 길을 그대로 그린다.
+//
+//   가로 본류        그 구간을 실제로 통과한 초당 건수. 띠가 얇아지는 곳이 막히는 곳이다.
+//   노드            길목의 자원. 막대 채움이 이용률, 사이에 뜬 숫자가 그 앞에 선 대기 건수.
+//   아래로 빠지는 띠  흐름 밖으로 나간 요청 — 큐 포화로 거절된 것, 끝냈지만 버려진 것(낭비).
+//   점선 표시        클라이언트가 포기한 순간. 본류는 줄지 않는다. 서버는 끝까지 처리하고,
+//                   그렇게 끝낸 것이 오른쪽 끝에서 「낭비」로 떨어진다.
+//   칸 안 추세선     그 자원의 최근 30초 이용률. 세로축은 0~100% 고정이라 칸끼리 바로 견준다.
 const INK = { line: '#e3e8ef', off: '#dbe2ea', lab: '#6b7a8c', ink: '#16202c', hot: '#b0201a', warn: '#a16207', accent: '#1f6feb' };
-const SEG = { q: '#dfe5ec', wc: '#aab6c4', db: '#1f6feb', cpu: '#7d8ea3' };
-// n개를 w×h 안에 가장 크게 배치하는 격자
-function fitGrid(w, h, n) {
-  let best = { cols: n, rows: 1, c: 0 };
-  for (let cols = 1; cols <= n; cols++) {
-    const rows = Math.ceil(n / cols), c = Math.min(w / cols, h / rows);
-    if (c > best.c) best = { cols, rows, c };
+const SEG = { q: '#cbd5e1', wc: '#94a3b8', db: '#1f6feb', cpu: '#64748b' };
+const EMPTY_H = { in: 0, out: 0, rej: 0, to: 0, retry: 0, wasted: 0, p50: 0, p95: 0, thU: 0, coU: 0, cpU: 0,
+  q: 0, wc: 0, cw: 0, brk: { q: 0, wc: 0, db: 0, cpu: 0 }, pass: { thread: 0, conn: 0, cpu: 0 }, lost: { q: 0, wc: 0, run: 0 } };
+
+function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(Math.max(1, v)))), m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
+function fmt(v) { return v >= 1000 ? (v / 1000).toFixed(1) + 'k' : Math.round(v).toString(); }
+function fmtMs(v) { return v >= 1000 ? (v / 1000).toFixed(1) + 's' : Math.round(v) + 'ms'; }
+const FONT = (s) => s + ' "Noto Sans KR", system-ui, sans-serif';
+
+function txt(s, x, y, align, color, font, baseline) {
+  sctx.textAlign = align || 'left'; sctx.textBaseline = baseline || 'middle';
+  sctx.fillStyle = color || INK.lab; sctx.font = font || FONT('10px');
+  sctx.fillText(s, x, y);
+}
+// 두께가 곧 rps 인 흐름 띠. (x0,c0) 에서 (x1,c1) 로 흐른다 — c 가 다르면 아래로 새는 가지가 된다
+function flowBand(x0, c0, t0, x1, c1, t1, col, alpha) {
+  if (t0 <= 0 && t1 <= 0) return;
+  const a0 = Math.max(t0, 1) / 2, a1 = Math.max(t1, 1) / 2, mx = (x0 + x1) / 2;
+  sctx.beginPath();
+  sctx.moveTo(x0, c0 - a0);
+  sctx.bezierCurveTo(mx, c0 - a0, mx, c1 - a1, x1, c1 - a1);
+  sctx.lineTo(x1, c1 + a1);
+  sctx.bezierCurveTo(mx, c1 + a1, mx, c0 + a0, x0, c0 + a0);
+  sctx.closePath();
+  sctx.globalAlpha = alpha == null ? .9 : alpha; sctx.fillStyle = col; sctx.fill(); sctx.globalAlpha = 1;
+}
+// 자원 칸 안에 들어가는 최근 추세 — 지금 값만으로는 "오르는 중인지"를 못 본다.
+// 세로축은 0~100% 고정이라 칸끼리 바로 견줄 수 있고, ref(버스터블 기준선)는 점선으로 깐다.
+function microSpark(x, y, w, h, vals, col, ref) {
+  sctx.fillStyle = '#f4f7fa'; sctx.fillRect(x, y, w, h);
+  if (vals && vals.length > 1) {
+    const px = (i) => x + i / (vals.length - 1) * w, py = (v) => y + h - Math.max(0, Math.min(1, v)) * h;
+    sctx.beginPath(); sctx.moveTo(px(0), y + h);
+    vals.forEach((v, i) => sctx.lineTo(px(i), py(v)));
+    sctx.lineTo(px(vals.length - 1), y + h); sctx.closePath();
+    sctx.globalAlpha = .18; sctx.fillStyle = col; sctx.fill(); sctx.globalAlpha = 1;
+    sctx.beginPath(); vals.forEach((v, i) => i ? sctx.lineTo(px(i), py(v)) : sctx.moveTo(px(i), py(v)));
+    sctx.strokeStyle = col; sctx.lineWidth = 1.2; sctx.stroke();
   }
-  return best;
-}
-function dotMatrix(bx, by, bw, bh, n, used, col) {
-  const g = fitGrid(bw, bh, n), cell = Math.min(g.c, 13);
-  const d = Math.max(2, cell - Math.max(1.2, cell * 0.24));
-  const ox = bx + (bw - g.cols * cell) / 2, oy = by + (bh - g.rows * cell) / 2;
-  for (let i = 0; i < n; i++) {
-    const r = Math.floor(i / g.cols), c = i % g.cols;
-    sctx.fillStyle = i < used ? col : INK.off;
-    if (d > 6) { roundRect(sctx, ox + c * cell, oy + r * cell, d, d, 1.5); sctx.fill(); }
-    else sctx.fillRect(ox + c * cell, oy + r * cell, d, d);
+  if (ref != null && ref > 0 && ref < 1) {
+    const ry = y + h - ref * h;
+    sctx.setLineDash([2, 2]); sctx.strokeStyle = INK.warn; sctx.lineWidth = 1;
+    sctx.beginPath(); sctx.moveTo(x, ry); sctx.lineTo(x + w, ry); sctx.stroke(); sctx.setLineDash([]);
   }
 }
-function cellBox(x, y, w, h, title) {
-  sctx.fillStyle = '#fff'; roundRect(sctx, x, y, w, h, 4); sctx.fill();
-  sctx.strokeStyle = COL.grid; sctx.lineWidth = 1; sctx.stroke();
-  sctx.textBaseline = 'top'; sctx.textAlign = 'left';
-  sctx.fillStyle = INK.ink; sctx.font = '700 10.5px "Noto Sans KR", system-ui, sans-serif';
-  sctx.fillText(title, x + 8, y + 6);
+// 길목의 자원 한 칸 — 채움이 곧 이용률, 아래 추세선이 곧 방향
+function flowNode(x, y, nw, nh, o) {
+  sctx.fillStyle = '#fff'; roundRect(sctx, x, y, nw, nh, 4); sctx.fill();
+  sctx.strokeStyle = o.util > .9 ? '#edc8c6' : COL.grid; sctx.lineWidth = 1; sctx.stroke();
+  const bx = x + 7, bw = nw - 14;
+  // 1줄: 제목 + 직전 5초 대비 변화
+  sctx.fillStyle = o.seg; sctx.fillRect(bx, y + 5, 6, 6);
+  txt(o.title, bx + 10, y + 8.5, 'left', INK.ink, FONT('700 10px'));
+  if (Math.abs(o.delta) >= .02)
+    txt(`${o.delta > 0 ? '▲' : '▼'}${Math.round(Math.abs(o.delta) * 100)}`, x + nw - 7, y + 8.5, 'right',
+      o.delta > 0 ? INK.hot : INK.lab, FONT('700 9px'));
+  // 2줄: 용량 막대 + 이용률
+  const barW = bw - 34;
+  sctx.fillStyle = INK.off; sctx.fillRect(bx, y + 16, barW, 7);
+  sctx.fillStyle = o.tone; sctx.fillRect(bx, y + 16, Math.max(0, Math.min(1, o.util)) * barW, 7);
+  txt(`${Math.round(o.util * 100)}%`, x + nw - 7, y + 20, 'right', o.tone, FONT('700 10.5px'));
+  // 3줄: 최근 추세
+  microSpark(bx, y + 27, bw, nh - 27 - 15, o.series, o.tone, o.ref);
+  // 4줄: 슬롯 수 · 이 자원을 못 잡아 앞에 선 건수 (체류 시간은 아래 시간 축이 번호로 받는다)
+  txt(`${fmt(o.used)}/${fmt(o.cap)}`, bx, y + nh - 7, 'left', INK.ink, FONT('700 9.5px'));
+  if (o.wait) txt(`대기 ${fmt(o.wait)}`, x + nw - 7, y + nh - 7, 'right', INK.warn, FONT('700 9.5px'));
+  else if (o.ref != null) txt(`지속 ${Math.round(o.ref * 100)}%`, x + nw - 7, y + nh - 7, 'right', INK.warn, FONT('9px'));
 }
+
+/* ── 5a. 요청 흐름도 — 선택한 인스턴스 한 대를 요청이 지나가는 길로 본다 ──────
+   한 칸 안에 「지금 값 · 최근 추세 · 방향 · 대기」를 넣는다. 추세 그래프가 본문이므로 칸을 크게 쓴다. */
 function drawStage(sim) {
   const S = sim.S, M = S.M;
   const { w, h, dpr } = fitCanvas(stage);
   sctx.setTransform(dpr, 0, 0, dpr, 0, 0); sctx.clearRect(0, 0, w, h);
-  const hh = S.history[S.history.length - 1] || { out: 0, rej: 0, to: 0, wasted: 0, in: 0, retry: 0, p50: 0, p95: 0, thU: 0, coU: 0, q: 0, wc: 0, brk: { q: 0, wc: 0, db: 0, cpu: 0 } };
+  const hh = S.history[S.history.length - 1] || EMPTY_H;
+  const b = hh.brk || EMPTY_H.brk, pass = hh.pass || EMPTY_H.pass, lost = hh.lost || EMPTY_H.lost;
   const th = theory(M);
-  const pad = 8, gap = 6, lat = 26;                       // lat: 아래 지연 띠
-  const cw = (w - pad * 2 - gap * 3) / 4, ch = h - pad * 2 - lat - 4;
-  const y = pad, headH = 20, footH = 14;
-  const X = (i) => pad + i * (cw + gap);
+  let qn = 0; for (const r of S.reqs) if (r.state === 'queued') qn++;
+
+  const pad = 8, titleH = 15;
+  const top = pad + titleH, bot = h - pad;
+  const area = bot - top;
+  const nh = Math.max(64, Math.min(136, area * 0.60));      // 칸을 크게 — 안의 추세 그래프가 이 화면의 본문이다
+  const cy = top + Math.max(nh / 2, area * 0.38);
+  const sinkY = bot - 14;
+  const nw = Math.max(92, Math.min(136, (w - pad * 2) * 0.175));
+  const gap = Math.max(20, (w - pad * 2 - nw * 4 - 46) / 5);
+  const X = (i) => pad + gap + i * (nw + gap);
+  const xEnd = w - pad - 44;
   const hot = (u) => u > .9 ? INK.hot : u > .75 ? INK.warn : INK.accent;
 
-  /* 1. 스레드 — 슬롯 매트릭스 */
-  {
-    const x = X(0); cellBox(x, y, cw, ch, '스레드');
-    const bx = x + 8, by = y + headH, bw = cw - 16, bh = ch - headH - footH - 4;
-    const n = M.threads, used = S.usedThreads;
-    dotMatrix(bx, by, bw, bh, n, used, hot(hh.thU));
-    sctx.textBaseline = 'bottom'; sctx.textAlign = 'left'; sctx.font = '700 11px "Noto Sans KR", system-ui, sans-serif';
-    sctx.fillStyle = INK.ink; sctx.fillText(`${used} / ${n}`, bx, y + ch - 5);
-    sctx.textAlign = 'right'; sctx.fillStyle = hot(hh.thU);
-    sctx.fillText(`${Math.round(hh.thU * 100)}%`, x + cw - 8, y + ch - 5);
+  // 흐름 → 띠 두께. 한 초 동안 그 구간을 지난 건수를 그대로 굵기로 쓴다
+  const maxF = Math.max(1, hh.in, pass.thread, pass.conn, pass.cpu, hh.out + hh.wasted);
+  const maxT = Math.min(46, nh * 0.34);
+  const T = (v) => v <= 0 ? 0 : Math.max(1.6, v / maxF * maxT);
+  // 칸 안 추세선 — 최근 30초 이용률, 직전 5초 대비 변화
+  const Hs = S.history.slice(-30);
+  const ser = (f) => Hs.map(d => Math.max(0, Math.min(1, f(d))));
+  const dlt = (a) => a.length >= 6 ? a[a.length - 1] - a[a.length - 6] : 0;
+
+  /* ── 제목 줄 ── */
+  txt(`요청 흐름${M.label ? ' · ' + M.label : ''}`, pad, pad + 6, 'left', INK.ink, FONT('700 11px'));
+  const BN = { cpu: 'vCPU', db: 'DB 커넥션', thread: '스레드/큐' };
+  txt(`유입 ${fmt(hh.in)}/s${hh.retry ? ` (재시도 ${fmt(hh.retry)})` : ''}  ·  완료 ${fmt(hh.out)}/s  ·  실패 ${fmt(hh.rej + hh.to)}/s`
+    + `  ·  p95 ${fmtMs(hh.p95)}  ·  병목 ${BN[th.bottle]}  ·  ρ ${(hh.in / Math.max(1, th.cap)).toFixed(2)}`,
+    w - pad, pad + 6, 'right', INK.lab, FONT('10px'));
+
+  /* ── 본류 (노드 뒤에 깔린다) ── */
+  const MAIN = COL.blueL || '#b6d1fa';
+  flowBand(pad, cy, T(hh.in), X(0), cy, T(hh.in), MAIN, .8);
+  flowBand(X(0) + nw, cy, T(pass.thread), X(1), cy, T(pass.thread), MAIN, .8);
+  flowBand(X(1) + nw, cy, T(pass.conn), X(2), cy, T(pass.conn), MAIN, .8);
+  flowBand(X(2) + nw, cy, T(pass.cpu), X(3), cy, T(pass.cpu), MAIN, .8);
+
+  /* ── 나가는 가지 ── */
+  // 거절: 큐가 꽉 차서 아예 들어오지 못한 것 (503). 본류에서 그만큼 빠진다
+  if (hh.rej > 0) {
+    const t = T(hh.rej), sx = X(0) - Math.min(30, gap * 0.5);
+    flowBand(sx, cy + T(hh.in) / 2, t, X(0) + nw * 0.55, sinkY, t, INK.hot, .85);
+    txt(`거절 ${fmt(hh.rej)}/s`, X(0) + nw * 0.55 + t / 2 + 5, sinkY, 'left', INK.hot, FONT('700 9.5px'));
+  }
+  // 완료 / 낭비: 끝까지 간 요청이 마지막에 갈라진다
+  const tDone = T(hh.out), tWaste = T(hh.wasted), tSum = tDone + tWaste;
+  if (tDone > 0) flowBand(X(3) + nw, cy - tSum / 2 + tDone / 2, tDone, xEnd, cy - tSum / 2 + tDone / 2, tDone, INK.accent, .9);
+  txt(`완료 ${fmt(hh.out)}/s`, xEnd + 5, cy - tSum / 2 + tDone / 2, 'left', INK.accent, FONT('700 9.5px'));
+  if (hh.wasted > 0) {
+    flowBand(X(3) + nw, cy + tSum / 2 - tWaste / 2, tWaste, xEnd - 14, sinkY, tWaste, INK.warn, .85);
+    txt(`낭비 ${fmt(hh.wasted)}/s`, xEnd - 14 + tWaste / 2 + 5, sinkY, 'left', INK.warn, FONT('700 9.5px'));
   }
 
-  /* 2. 커넥션 — 슬롯 매트릭스 (개수가 적어 점이 크다) */
-  {
-    const x = X(1); cellBox(x, y, cw, ch, '커넥션');
-    const bx = x + 8, by = y + headH, bw = cw - 16, bh = ch - headH - footH - 4;
-    const n = M.conns, used = S.usedConns;
-    dotMatrix(bx, by, bw, bh, n, used, hot(hh.coU));
-    sctx.textBaseline = 'bottom'; sctx.textAlign = 'left'; sctx.font = '700 11px "Noto Sans KR", system-ui, sans-serif';
-    sctx.fillStyle = INK.ink; sctx.fillText(`${used} / ${n}`, bx, y + ch - 5);
-    sctx.textAlign = 'right'; sctx.fillStyle = hot(hh.coU);
-    sctx.fillText(`${Math.round(hh.coU * 100)}%`, x + cw - 8, y + ch - 5);
-  }
-
-  /* 3. 대기 큐 — 적체 추세 스파크라인 (큐는 "지금 값"보다 "쌓이는가"가 중요하다) */
-  {
-    const x = X(2); cellBox(x, y, cw, ch, '대기 큐');
-    const bx = x + 8, by = y + headH, bw = cw - 16, bh = ch - headH - footH - 4;
-    const H = S.history.slice(-40), u = hh.q / M.queueCap;
-    sctx.strokeStyle = INK.line; sctx.lineWidth = 1;
-    sctx.beginPath(); sctx.moveTo(bx, by + bh); sctx.lineTo(bx + bw, by + bh); sctx.stroke();
-    if (H.length > 1) {
-      const mq = Math.max(M.queueCap * 0.15, ...H.map(d => d.q));
-      const px = (i) => bx + i / (H.length - 1) * bw, py = (v) => by + bh - Math.min(1, v / mq) * bh;
-      sctx.beginPath(); sctx.moveTo(px(0), by + bh);
-      H.forEach((d, i) => sctx.lineTo(px(i), py(d.q)));
-      sctx.lineTo(px(H.length - 1), by + bh); sctx.closePath();
-      sctx.fillStyle = u > .75 ? '#f6dedd' : '#e6eefc'; sctx.fill();
-      sctx.beginPath(); H.forEach((d, i) => i ? sctx.lineTo(px(i), py(d.q)) : sctx.moveTo(px(i), py(d.q)));
-      sctx.strokeStyle = hot(u); sctx.lineWidth = 1.5; sctx.stroke();
-    }
-    sctx.textBaseline = 'bottom'; sctx.textAlign = 'left'; sctx.font = '700 11px "Noto Sans KR", system-ui, sans-serif';
-    sctx.fillStyle = INK.ink; sctx.fillText(`${hh.q} / ${M.queueCap}`, bx, y + ch - 5);
-    sctx.textAlign = 'right'; sctx.fillStyle = hot(u);
-    sctx.fillText(`${Math.round(u * 100)}%`, x + cw - 8, y + ch - 5);
-  }
-
-  /* 4. 요청 수지 — 유입 한 줄기가 완료/실패/낭비로 갈라지는 흐름 */
-  {
-    const x = X(3); cellBox(x, y, cw, ch, '요청 수지');
-    const bx = x + 8, by = y + headH, bw = cw - 16, bh = ch - headH - footH - 4;
-    const raw = [['완료', hh.out, INK.accent], ['실패', hh.rej + hh.to, INK.hot], ['낭비', hh.wasted, SEG.wc]];
-    const sum = Math.max(1, raw.reduce((a, p) => a + p[1], 0));
-    const parts = raw.map(p => [p[0], p[1] / sum, p[2]]).filter(p => p[1] > 0.004);
-    const stemW = 6, gapY = 3, H = bh - gapY * Math.max(0, parts.length - 1);
-    sctx.fillStyle = INK.off; sctx.fillRect(bx, by, stemW, bh);     // 유입 기둥
-    const rx = bx + 30, rw = Math.max(18, bw - 30 - 48);
-    let ly = by, ry = by;
-    for (const [nm, v, c] of parts) {
-      const t = Math.max(1.5, v * H);
-      sctx.fillStyle = c; sctx.globalAlpha = 0.9;
-      sctx.beginPath();
-      sctx.moveTo(bx + stemW, ly);
-      sctx.bezierCurveTo(rx - 14, ly, rx - 24, ry, rx, ry);
-      sctx.lineTo(rx + rw, ry); sctx.lineTo(rx + rw, ry + t); sctx.lineTo(rx, ry + t);
-      sctx.bezierCurveTo(rx - 24, ry + t, rx - 14, ly + t, bx + stemW, ly + t);
-      sctx.closePath(); sctx.fill(); sctx.globalAlpha = 1;
-      sctx.textBaseline = 'middle'; sctx.textAlign = 'left';
-      sctx.fillStyle = INK.lab; sctx.font = '9.5px "Noto Sans KR", system-ui, sans-serif';
-      sctx.fillText(`${nm} ${Math.round(v * 100)}%`, rx + rw + 4, ry + t / 2);
-      ly += t; ry += t + gapY;
-    }
-    sctx.textBaseline = 'bottom'; sctx.textAlign = 'left'; sctx.font = '700 11px "Noto Sans KR", system-ui, sans-serif';
-    sctx.fillStyle = INK.ink; sctx.fillText(`유입 ${hh.in}/s`, bx, y + ch - 5);
-    if (hh.retry > 0) { sctx.textAlign = 'right'; sctx.fillStyle = INK.warn; sctx.font = '10px "Noto Sans KR", system-ui, sans-serif';
-      sctx.fillText(`재시도 ${hh.retry}`, x + cw - 8, y + ch - 5); }
-  }
-
-  /* 5. 지연 분해 — 한 건의 시간이 어느 구간에서 나갔나 (전폭 띠 한 줄) */
-  {
-    const sy = y + ch + 4, sh = lat - 4, fullW = w - pad * 2, cy = sy + sh / 2;
-    sctx.fillStyle = '#fff'; roundRect(sctx, pad, sy, fullW, sh, 4); sctx.fill();
-    sctx.strokeStyle = COL.grid; sctx.lineWidth = 1; sctx.stroke();
-    sctx.textBaseline = 'middle'; sctx.textAlign = 'left';
-    sctx.fillStyle = INK.ink; sctx.font = '700 10.5px "Noto Sans KR", system-ui, sans-serif';
-    sctx.fillText('지연 분해', pad + 8, cy);
-    const b = hh.brk, tot = b.q + b.wc + b.db + b.cpu;
-    const bx = pad + 62, bw = Math.max(60, fullW - 62 - 236), bh = 11, by = cy - bh / 2;
-    sctx.fillStyle = INK.line; sctx.fillRect(bx, by, bw, bh);
-    let cx = bx;
-    for (const [nm, k] of [['큐', 'q'], ['커넥션', 'wc'], ['DB', 'db'], ['CPU', 'cpu']]) {
-      const fw = tot > 0 ? b[k] / tot * bw : 0; if (fw <= .5) continue;
-      sctx.fillStyle = SEG[k]; sctx.fillRect(cx, by, Math.min(fw, bx + bw - cx), bh);
-      if (fw > 34) { sctx.fillStyle = k === 'db' ? '#fff' : INK.ink; sctx.font = '700 9px "Noto Sans KR", system-ui, sans-serif';
-        sctx.textAlign = 'center'; sctx.fillText(nm, cx + fw / 2, cy); sctx.textAlign = 'left'; }
-      cx += fw;
-    }
-    sctx.textAlign = 'right'; sctx.fillStyle = INK.lab; sctx.font = '10px "Noto Sans KR", system-ui, sans-serif';
-    sctx.fillText(`평균 ${Math.round(tot)}ms  ·  p95 ${Math.round(hh.p95)}/${$('sloP95').value}ms  ·  병목 ${th.dbBottle ? 'DB' : '앞단'}  ·  최대 ${th.cap.toFixed(0)}rps`, pad + fullW - 8, cy);
-  }
-}
-function wrapText(c, text, x, y, maxW, lh) {
-  const words = text.split(' '); let line = '', yy = y;
-  for (const wd of words) { const t = line ? line + ' ' + wd : wd;
-    if (c.measureText(t).width > maxW && line) { c.fillText(line, x, yy); line = wd; yy += lh; } else line = t; }
-  if (line) c.fillText(line, x, yy);
-}
-
-// ── 타임라인: 처리량 / 응답시간 / 이용률·큐. 시나리오 단계 마커 포함 ──
-const TL = { hoverX: null };
-function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(Math.max(1, v)))), m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
-function fmt(v) { return v >= 1000 ? (v / 1000).toFixed(1) + 'k' : Math.round(v).toString(); }
-function drawTimeline(sim) {
-  const S = sim.S, M = S.M, H = S.history, N = M.historySec;
-  const { w, h, dpr } = fitCanvas(tl); tctx.setTransform(dpr, 0, 0, dpr, 0, 0); tctx.clearRect(0, 0, w, h);
-  const padL = 38, padR = 12, padT = 22, padB = 16, gapY = 14, ph = (h - padT - padB - gapY) / 2;
-  const panels = [
-    { y: padT, title: '처리량', series: [{ k: 'in', name: '유입', c: COL.s_in }, { k: 'out', name: '완료', c: COL.s_out }, { k: 'fail', name: '실패', c: COL.s_rej }, { k: 'retry', name: '재시도', c: COL.s_retry, dash: [3, 3] }] , unit: '/s' },
-    { y: padT + ph + gapY, title: '응답시간', series: [{ k: 'p50', name: 'p50', c: COL.s_p50 }, { k: 'p95', name: 'p95', c: COL.s_p95 }], ref: M.timeoutMs, unit: ' ms' },
+  /* ── 노드 네 개 ── */
+  const sQ = ser(d => d.q / Math.max(1, M.queueCap)), sTh = ser(d => d.thU), sDb = ser(d => d.coU), sCp = ser(d => d.cpU || 0);
+  const N = [
+    { seg: SEG.q,   title: '1 대기 큐',   used: qn,            cap: M.queueCap,   util: qn / Math.max(1, M.queueCap), series: sQ,  delta: dlt(sQ) },
+    { seg: SEG.wc,  title: '2 스레드',    used: S.usedThreads, cap: M.threads,    util: hh.thU,                        series: sTh, delta: dlt(sTh) },
+    { seg: SEG.db,  title: '3 DB 커넥션', used: S.usedConns,   cap: M.conns,      util: hh.coU,                        series: sDb, delta: dlt(sDb), wait: hh.wc },
+    { seg: SEG.cpu, title: '4 vCPU',      used: S.usedCores,   cap: M.cores || 0, util: hh.cpU || 0,                   series: sCp, delta: dlt(sCp), wait: hh.cw,
+      ref: M.baseline != null && M.baseline < 1 ? M.baseline : null },   // 버스터블 지속 가능선
   ];
-  const val = (d, k) => k === 'fail' ? d.rej + d.to : k === 'thUp' ? d.thU * 100 : k === 'coUp' ? d.coU * 100 : k === 'qp' ? d.q / M.queueCap * 100 : d[k];
-  const t0 = H.length ? H[H.length - 1].t - N : 0, X = (t) => padL + (t - t0) / N * (w - padL - padR);
-  tctx.font = '11px "Noto Sans KR", system-ui, sans-serif'; tctx.textBaseline = 'middle';
-  for (const p of panels) {
-    let max = p.fixedMax || 10; if (!p.fixedMax) { for (const s of p.series) for (const d of H) max = Math.max(max, val(d, s.k)); max = niceMax(max); }
-    const Y = (v) => p.y + ph - Math.min(v, max) / max * ph;
-    tctx.strokeStyle = COL.grid; tctx.lineWidth = 1; tctx.fillStyle = COL.muted; tctx.textAlign = 'right';
-    tctx.font = '9px "Noto Sans KR", system-ui, sans-serif';
-    for (let i = 0; i <= 2; i++) { const v = max * i / 2, y = Y(v); tctx.beginPath(); tctx.moveTo(padL, y); tctx.lineTo(w - padR, y); tctx.stroke(); tctx.fillText(fmt(v), padL - 5, y); }
-    tctx.textAlign = 'left'; tctx.textBaseline = 'bottom'; tctx.fillStyle = COL.ink; tctx.font = '700 10px "Noto Sans KR", system-ui, sans-serif'; tctx.fillText(p.title, padL, p.y - 4);
-    let lx = padL + tctx.measureText(p.title).width + 12; tctx.font = '11px "Noto Sans KR", system-ui, sans-serif';
-    for (const s of p.series) { tctx.strokeStyle = s.c; tctx.lineWidth = 2; tctx.setLineDash(s.dash || []); tctx.beginPath(); tctx.moveTo(lx, p.y - 8); tctx.lineTo(lx + 10, p.y - 8); tctx.stroke(); tctx.setLineDash([]); tctx.fillStyle = COL.ink2; tctx.fillText(s.name, lx + 13, p.y - 4); lx += 13 + tctx.measureText(s.name).width + 10; }
-    tctx.textBaseline = 'middle';
-    if (p.ref && p.ref <= max) { tctx.setLineDash([3, 3]); tctx.strokeStyle = COL.s_rej; tctx.lineWidth = 1; tctx.beginPath(); tctx.moveTo(padL, Y(p.ref)); tctx.lineTo(w - padR, Y(p.ref)); tctx.stroke(); tctx.setLineDash([]); tctx.fillStyle = COL.s_rej; tctx.textAlign = 'right'; tctx.fillText('타임아웃', w - padR - 2, Y(p.ref) - 7); tctx.textAlign = 'left'; }
-    tctx.lineWidth = 2; tctx.lineJoin = 'round';
-    for (const s of p.series) { tctx.strokeStyle = s.c; tctx.setLineDash(s.dash || []); tctx.beginPath(); H.forEach((d, i) => { const x = X(d.t), y = Y(val(d, s.k)); i ? tctx.lineTo(x, y) : tctx.moveTo(x, y); }); tctx.stroke(); tctx.setLineDash([]); }
-    p.Y = Y;
-  }
-  // 시나리오 단계 마커
-  const sc = SCENARIOS[scenarioKey];
-  if (sc.period && H.length) { const base = scenarioStart / 1000, tEnd = H[H.length - 1].t;
-    for (let k = 0; base + k * sc.period <= tEnd; k++) for (const st of sc.explain) { const t = base + k * sc.period + st.t; if (t < t0 || t > tEnd) continue; const x = X(t);
-      tctx.strokeStyle = COL.axis; tctx.setLineDash([2, 4]); tctx.beginPath(); tctx.moveTo(x, padT); tctx.lineTo(x, h - padB); tctx.stroke(); tctx.setLineDash([]);
-      tctx.fillStyle = COL.muted; tctx.font = '10px "Noto Sans KR", system-ui, sans-serif'; tctx.textBaseline = 'bottom'; tctx.textAlign = 'left'; tctx.fillText(`▸${st.t}s`, x + 2, h - padB - 2); tctx.textBaseline = 'middle'; } }
-  // x축
-  tctx.fillStyle = COL.muted; tctx.font = '11px "Noto Sans KR", system-ui, sans-serif'; tctx.textAlign = 'center'; tctx.textBaseline = 'top';
-  const step = N <= 60 ? 10 : N <= 120 ? 20 : 60;
-  for (let s = 0; s <= N; s += step) { const t = t0 + s; if (t < 0) continue; tctx.fillText(`${Math.round(t)}s`, X(t), h - padB + 6); }
-  // 크로스헤어 + 툴팁
-  const tip = $('tooltip');
-  if (TL.hoverX != null && H.length > 1) {
-    const tt = t0 + (TL.hoverX - padL) / (w - padL - padR) * N; let best = H[0]; for (const d of H) if (Math.abs(d.t - tt) < Math.abs(best.t - tt)) best = d;
-    const x = X(best.t);
-    tctx.strokeStyle = COL.ink2; tctx.setLineDash([2, 3]); tctx.lineWidth = 1; tctx.beginPath(); tctx.moveTo(x, padT - 4); tctx.lineTo(x, h - padB); tctx.stroke(); tctx.setLineDash([]);
-    for (const p of panels) for (const s of p.series) { tctx.fillStyle = s.c; tctx.beginPath(); tctx.arc(x, p.Y(val(best, s.k)), 3.5, 0, 7); tctx.fill(); tctx.strokeStyle = '#fff'; tctx.lineWidth = 1.5; tctx.stroke(); }
-    tip.style.display = 'block';
-    tip.innerHTML = `<div class="r"><b>t = ${best.t.toFixed(0)}s</b><span>설정 유입 ${best.rps}rps · DB ${Math.round(best.dbTimeMs)}ms</span></div>` +
-      panels.flatMap(p => p.series.map(s => `<div class="r"><span><i style="background:${s.c}"></i>${s.name}</span><span>${fmt(val(best, s.k))}${p.unit}</span></div>`)).join('') +
-      `<div class="r"><span>낭비(고아) / 큐 / 커넥션 대기</span><span>${best.wasted}/s · ${best.q} · ${best.wc}</span></div>`;
-    const rect = tl.parentElement.getBoundingClientRect(); tip.style.left = Math.min(x + 12, rect.width - tip.offsetWidth - 8) + 'px'; tip.style.top = '40px';
-  } else tip.style.display = 'none';
-}
-tl.addEventListener('mousemove', (e) => { TL.hoverX = e.offsetX; }); tl.addEventListener('mouseleave', () => { TL.hoverX = null; });
-$('win').addEventListener('change', () => { MODEL.historySec = +$('win').value; });
+  N.forEach((o, i) => { o.tone = hot(o.util); flowNode(X(i), cy - nh / 2, nw, nh, o); });
 
-// ── 검증 차트: x=rps, y=p95 — 실측 vs 시뮬 ──
-const VERIFY = { real: [], sim: [], hoverX: null };
-// 설정 후보 비교(D9)가 채우는 레이어. 엔진은 그리기만 하고 내용은 advisor.js 가 넣는다.
-//   curves: [{ name, color, pts:[{rps,p50,p95,err}], knee }]   knee = 과부하 시작 rps (null이면 스윕 구간 내내 여유)
-const CANDV = { curves: [], show: false, p95Target: 0, peak: 0 };
-function drawVerify() {
-  const { w, h, dpr } = fitCanvas(vf); vctx.setTransform(dpr, 0, 0, dpr, 0, 0); vctx.clearRect(0, 0, w, h);
-  const padL = 44, padR = 12, padB = 26;
-  const CV = CANDV.show ? CANDV.curves : [];
-  const all = [...VERIFY.real, ...VERIFY.sim, ...CV.reduce((a, c) => a.concat(c.pts), [])];
-  // 범례를 먼저 배치해 필요한 줄 수를 구하고, 그만큼 위 여백을 잡는다 (후보가 늘어도 겹치지 않는다)
-  const legend = [];
-  if (VERIFY.real.length) legend.push([`실측 ${VERIFY.real.length}점`, COL.s_real]);
-  if (VERIFY.sim.length) legend.push([`시뮬 ${VERIFY.sim.length}점`, COL.s_sim]);
-  for (const c of CV) legend.push([c.name, c.color]);
-  vctx.font = '10.5px "Noto Sans KR", system-ui, sans-serif';
-  const lay = []; let legendRows = 0, lgx = padL;
-  for (const it of legend) {
-    const tw = 12 + vctx.measureText(it[0]).width + 12;
-    if (lgx + tw > w - padR && lgx > padL) { lgx = padL; legendRows++; }
-    lay.push({ it, x: lgx, row: legendRows }); lgx += tw;
+  /* ── 포기(타임아웃): 본류는 줄지 않는다. 표시만 하고, 결과는 오른쪽 끝 「낭비」로 나온다 ── */
+  sctx.setLineDash([3, 3]); sctx.lineWidth = 1.2; sctx.strokeStyle = INK.warn;
+  [lost.q, lost.wc, lost.run].forEach((n, i) => {
+    if (!n) return;
+    const x = X(i) + nw * 0.28, y0 = cy + nh / 2 + 3, y1 = Math.min(y0 + 14, sinkY - 12);
+    sctx.beginPath(); sctx.moveTo(x, y0); sctx.lineTo(x, y1); sctx.stroke();
+    txt(`포기 ${fmt(n)}/s`, x + 4, y1, 'left', INK.warn, FONT('700 9.5px'));
+  });
+  sctx.setLineDash([]);
+  // 재시도: 실패한 쪽이 다시 유입으로 돌아온다 (이 되먹임이 재시도 폭풍을 스스로 유지시킨다)
+  if (hh.retry > 0) {
+    const ry = bot - 2;
+    sctx.setLineDash([4, 3]); sctx.strokeStyle = INK.warn; sctx.lineWidth = 1.2;
+    sctx.beginPath(); sctx.moveTo(xEnd - 14, ry); sctx.lineTo(pad + 6, ry); sctx.stroke();
+    sctx.setLineDash([]);
+    sctx.beginPath(); sctx.moveTo(pad + 6, ry); sctx.lineTo(pad + 12, ry - 3.5); sctx.lineTo(pad + 12, ry + 3.5); sctx.closePath();
+    sctx.fillStyle = INK.warn; sctx.fill();
+    txt(`재시도 ${fmt(hh.retry)}/s 가 유입으로 되돌아온다`, (pad + xEnd) / 2, ry - 6, 'center', INK.warn, FONT('700 9.5px'));
   }
-  if (legend.length) legendRows++;
-  const padT = 62 + legendRows * 15;   // 위쪽 44px 은 패널 제목 + #verifyBar 버튼 줄이 덮는다
-  const maxX = niceMax(Math.max(100, ...all.map(d => d.rps))), maxY = niceMax(Math.max(100, ...all.map(d => d.p95)));
-  const X = (v) => padL + v / maxX * (w - padL - padR), Y = (v) => padT + (h - padT - padB) - v / maxY * (h - padT - padB);
-  vctx.font = '11px "Noto Sans KR", system-ui, sans-serif'; vctx.strokeStyle = COL.grid; vctx.fillStyle = COL.muted; vctx.lineWidth = 1;
-  vctx.textAlign = 'right'; vctx.textBaseline = 'middle';
-  for (let i = 0; i <= 4; i++) { const v = maxY * i / 4; vctx.beginPath(); vctx.moveTo(padL, Y(v)); vctx.lineTo(w - padR, Y(v)); vctx.stroke(); vctx.fillText(fmt(v), padL - 6, Y(v)); }
-  vctx.textAlign = 'center'; vctx.textBaseline = 'top';
-  for (let i = 0; i <= 5; i++) { const v = maxX * i / 5; vctx.fillText(fmt(v) + ' rps', X(v), h - padB + 6); }
-  vctx.textAlign = 'left'; vctx.textBaseline = 'bottom'; vctx.fillStyle = COL.ink2; vctx.font = '600 11px "Noto Sans KR", system-ui, sans-serif';
-  vctx.fillText('p95 / 유입', padL, 56);
-  vctx.font = '10.5px "Noto Sans KR", system-ui, sans-serif';
-  for (const { it, x, row } of lay) {
-    const y = 72 + row * 15;
-    vctx.fillStyle = it[1]; vctx.fillRect(x, y - 9, 9, 9);
-    vctx.fillStyle = COL.ink2; vctx.fillText(it[0], x + 12, y);
+
+}
+
+/* ── 5b. EC2 인스턴스 실시간 비교 ─────────────────────────────────────────
+   같은 트래픽·같은 서버 설정을 인스턴스마다 한 벌씩 동시에 돌리고, 부하 테스트처럼
+   1초마다 세 지표를 나란히 그린다. 인스턴스마다 다른 것은 vCPU 할당과 메모리(=스레드 상한)뿐이므로,
+   선이 갈라지는 순간이 곧 "CPU 할당이 부족해지는 순간"이다.
+     ① CPU 이용률 — 점선은 버스터블(t계열)이 지속 가능한 기준선
+     ② p95 응답   — 점선은 목표 p95
+     ③ 처리량     — 회색 점선은 유입(공통), 색선은 인스턴스별 완료
+   opts: { win, p95, marks:[{t,text}] }                                       */
+const CMPV = { hoverX: null };
+function drawCompare(list, opts) {
+  const { w, h, dpr } = fitCanvas(cmpc);
+  cctx.setTransform(dpr, 0, 0, dpr, 0, 0); cctx.clearRect(0, 0, w, h);
+  const N = opts.win || 60;
+  const padL = 40, padR = 10, padT = 40, padB = 14, gapY = 18;
+  const hists = list.map(it => it.sim.S.history);
+  const anyH = hists.find(H => H.length) || [];
+  if (!anyH.length) {
+    cctx.fillStyle = COL.muted; cctx.textAlign = 'center'; cctx.textBaseline = 'middle';
+    cctx.font = '11px "Noto Sans KR", system-ui, sans-serif';
+    cctx.fillText(list.length ? '부하 테스트 시작 중…' : '왼쪽에서 비교할 인스턴스를 고르세요', w / 2, h / 2);
+    return;
   }
-  const line = (pts, c) => { if (!pts.length) return; const s = pts.slice().sort((a, b) => a.rps - b.rps); vctx.strokeStyle = c; vctx.lineWidth = 2; vctx.beginPath(); s.forEach((d, i) => i ? vctx.lineTo(X(d.rps), Y(d.p95)) : vctx.moveTo(X(d.rps), Y(d.p95))); vctx.stroke();
-    for (const d of s) { vctx.fillStyle = c; vctx.beginPath(); vctx.arc(X(d.rps), Y(d.p95), 4, 0, 7); vctx.fill(); vctx.strokeStyle = COL.surface; vctx.lineWidth = 2; vctx.stroke(); } };
-  line(VERIFY.real, COL.s_real); line(VERIFY.sim, COL.s_sim);
-  // ── 후보 비교 레이어 ── 가로 점선 = 목표 p95(= 무너졌다고 보는 선), 세로 점선 = 그 선을 넘는 rps
-  if (CV.length) {
-    if (CANDV.peak > 0 && CANDV.peak <= maxX) {
-      vctx.strokeStyle = COL.axis; vctx.setLineDash([2, 4]); vctx.lineWidth = 1;
-      vctx.beginPath(); vctx.moveTo(X(CANDV.peak), padT); vctx.lineTo(X(CANDV.peak), h - padB); vctx.stroke(); vctx.setLineDash([]);
-      vctx.fillStyle = COL.muted; vctx.textAlign = 'center'; vctx.textBaseline = 'top'; vctx.font = '10px "Noto Sans KR", system-ui, sans-serif';
-      vctx.fillText(`피크 ${CANDV.peak}`, X(CANDV.peak), h - padB + 13);
+  const tEnd = anyH[anyH.length - 1].t, t0 = tEnd - N;
+  const X = (t) => padL + (t - t0) / N * (w - padL - padR);
+  const rows = [
+    { title: 'CPU 이용률', unit: '%', fixedMax: 100, get: (d) => (d.cpU || 0) * 100, baseline: true },
+    { title: 'p95 응답', unit: 'ms', get: (d) => d.p95, ref: opts.p95, refName: '목표' },
+    { title: '처리량', unit: '/s', get: (d) => d.out, showIn: true },
+  ];
+  const ph = (h - padT - padB - gapY * (rows.length - 1)) / rows.length;
+
+  // ── 색은 한 번에 하나만 ────────────────────────────────────────────────
+  //  선이 전부 제 색을 주장하면 "지금 무엇을 보고 있는지"가 흐려진다. 그래서 기본은 검정이고,
+  //  고른 인스턴스(위 흐름도에 띄운 것)만 색으로 앞에 나온다. 나머지는 옅은 검정으로 뒤에 깔린다.
+  const CK = (it) => it.sel ? it.color : INK.ink;          // 선·점·기준선 색
+  const CA = (it) => it.sel ? 1 : 0.45;                    // 안 고른 것은 옅은 검정으로 뒤에
+  const zOrder = list.map((it, i) => ({ it, i })).sort((a, b) => (a.it.sel ? 1 : 0) - (b.it.sel ? 1 : 0));
+
+  // 범례 — 선택된 인스턴스(단면도에 뜬 것)는 색 + 굵게. 제목과 겹치지 않게 오른쪽 정렬.
+  cctx.textBaseline = 'middle'; cctx.textAlign = 'left';
+  const lab = list.map(it => `${it.type} (${it.vcpu}vCPU)`);
+  cctx.font = '10.5px "Noto Sans KR", system-ui, sans-serif';
+  const lw = lab.map(t => 12 + cctx.measureText(t).width + 14);
+  let lx = Math.max(padL + 150, w - padR - lw.reduce((a, b) => a + b, 0) + 14);
+  list.forEach((it, i) => {
+    cctx.globalAlpha = CA(it); cctx.fillStyle = CK(it); cctx.fillRect(lx, 7, 9, 9); cctx.globalAlpha = 1;
+    cctx.fillStyle = it.sel ? COL.ink : COL.muted;
+    cctx.font = `${it.sel ? 700 : 400} 10.5px "Noto Sans KR", system-ui, sans-serif`;
+    cctx.fillText(lab[i], lx + 12, 12);
+    lx += lw[i];
+  });
+
+  rows.forEach((p, ri) => {
+    const py0 = padT + ri * (ph + gapY);
+    let max = p.fixedMax || 10;
+    if (!p.fixedMax) {
+      for (const H of hists) for (const d of H) if (d.t >= t0) max = Math.max(max, p.get(d));
+      if (p.showIn) for (const d of anyH) if (d.t >= t0) max = Math.max(max, d.in);
+      if (p.ref) max = Math.max(max, p.ref * 1.2);
+      max = niceMax(max);
     }
-    if (CANDV.p95Target > 0 && CANDV.p95Target <= maxY) {
-      vctx.strokeStyle = COL.axis; vctx.setLineDash([4, 3]); vctx.lineWidth = 1;
-      vctx.beginPath(); vctx.moveTo(padL, Y(CANDV.p95Target)); vctx.lineTo(w - padR, Y(CANDV.p95Target)); vctx.stroke(); vctx.setLineDash([]);
-      vctx.fillStyle = COL.muted; vctx.textAlign = 'left'; vctx.textBaseline = 'bottom'; vctx.font = '10px "Noto Sans KR", system-ui, sans-serif';
-      vctx.fillText(`목표 p95 ${CANDV.p95Target}ms`, padL + 4, Y(CANDV.p95Target) - 3);
+    const Y = (v) => py0 + ph - Math.min(v, max) / max * ph;
+    // 격자 + y 라벨
+    cctx.strokeStyle = COL.grid; cctx.lineWidth = 1; cctx.fillStyle = COL.muted;
+    cctx.textAlign = 'right'; cctx.textBaseline = 'middle'; cctx.font = '9px "Noto Sans KR", system-ui, sans-serif';
+    for (let i = 0; i <= 2; i++) { const v = max * i / 2, yy = Y(v);
+      cctx.beginPath(); cctx.moveTo(padL, yy); cctx.lineTo(w - padR, yy); cctx.stroke();
+      cctx.fillText(fmt(v), padL - 4, yy); }
+    // 소제목 — 패널 위쪽 여백에
+    cctx.textAlign = 'left'; cctx.textBaseline = 'bottom'; cctx.fillStyle = COL.ink;
+    cctx.font = '700 10px "Noto Sans KR", system-ui, sans-serif';
+    cctx.fillText(`${p.title} (${p.unit})`, padL, py0 - 3);
+    // 기준선 (목표 p95)
+    if (p.ref && p.ref <= max) {
+      cctx.strokeStyle = COL.s_rej; cctx.setLineDash([3, 3]); cctx.lineWidth = 1;
+      cctx.beginPath(); cctx.moveTo(padL, Y(p.ref)); cctx.lineTo(w - padR, Y(p.ref)); cctx.stroke(); cctx.setLineDash([]);
+      cctx.fillStyle = COL.s_rej; cctx.textAlign = 'right'; cctx.textBaseline = 'bottom';
+      cctx.font = '9px "Noto Sans KR", system-ui, sans-serif';
+      cctx.fillText(`${p.refName} ${p.ref}`, w - padR - 2, Y(p.ref) - 2);
     }
-    CV.forEach((c, i) => {
-      line(c.pts, c.color);
-      if (c.knee != null && c.knee <= maxX) {
-        vctx.strokeStyle = c.color; vctx.setLineDash([3, 3]); vctx.lineWidth = 1.5;
-        vctx.beginPath(); vctx.moveTo(X(c.knee), padT); vctx.lineTo(X(c.knee), h - padB); vctx.stroke(); vctx.setLineDash([]);
-        // 과부하 지점이 가까우면 숫자가 겹친다 — 한 칸씩 내려 쓴다
-        vctx.fillStyle = c.color; vctx.textAlign = 'center'; vctx.textBaseline = 'top'; vctx.font = '700 10px "Noto Sans KR", system-ui, sans-serif';
-        vctx.fillText(String(c.knee), X(c.knee), padT + 2 + (i % 3) * 12);
-      }
-      // 이 설정이 지금 트래픽(피크)에서 서 있는 위치 — 네모 마커
-      if (CANDV.peak > 0 && c.at) {
-        const mx = X(CANDV.peak), my = Y(c.at.p95);
-        vctx.fillStyle = c.color; vctx.fillRect(mx - 4, my - 4, 8, 8);
-        vctx.strokeStyle = '#fff'; vctx.lineWidth = 1.5; vctx.strokeRect(mx - 4, my - 4, 8, 8);
-      }
-    });
-    vctx.font = '11px "Noto Sans KR", system-ui, sans-serif';
+    // 버스터블 지속 기준선 — t계열은 이 선 위로 오래 있을 수 없다 (크레딧 소진 후 스로틀)
+    if (p.baseline) for (const it of list) {
+      if (!(it.baseline > 0 && it.baseline < 1)) continue;
+      const yy = Y(it.baseline * 100);
+      cctx.strokeStyle = CK(it); cctx.globalAlpha = it.sel ? .55 : .28; cctx.setLineDash([2, 4]); cctx.lineWidth = 1;
+      cctx.beginPath(); cctx.moveTo(padL, yy); cctx.lineTo(w - padR, yy); cctx.stroke();
+      cctx.setLineDash([]);
+      cctx.fillStyle = CK(it); cctx.textAlign = 'left'; cctx.textBaseline = 'bottom';
+      cctx.font = '9px "Noto Sans KR", system-ui, sans-serif';
+      cctx.fillText(`${it.type} 지속 ${Math.round(it.baseline * 100)}%`, padL + 3, yy - 2);
+      cctx.globalAlpha = 1;
+    }
+    // 유입 (공통) — 회색 점선
+    if (p.showIn) {
+      cctx.strokeStyle = COL.s_in; cctx.setLineDash([4, 3]); cctx.lineWidth = 1.5; cctx.beginPath();
+      let first = true;
+      for (const d of anyH) { if (d.t < t0) continue; const x = X(d.t), yy = Y(d.in); first ? cctx.moveTo(x, yy) : cctx.lineTo(x, yy); first = false; }
+      cctx.stroke(); cctx.setLineDash([]);
+    }
+    // 인스턴스별 실선 — 안 고른 것(검정)을 먼저 깔고, 고른 것(색)을 맨 위에 그린다
+    for (const { it, i } of zOrder) {
+      const H = hists[i]; if (!H.length) continue;
+      cctx.strokeStyle = CK(it); cctx.globalAlpha = CA(it);
+      cctx.lineWidth = it.sel ? 2.4 : 1.3; cctx.lineJoin = 'round'; cctx.beginPath();
+      let first = true;
+      for (const d of H) { if (d.t < t0) continue; const x = X(d.t), yy = Y(p.get(d)); first ? cctx.moveTo(x, yy) : cctx.lineTo(x, yy); first = false; }
+      cctx.stroke(); cctx.globalAlpha = 1;
+    }
+    p.Y = Y; p.y0 = py0;
+  });
+
+  // 시나리오 단계 마커 (언제 무슨 일이 일어났나)
+  if (opts.marks) for (const m of opts.marks) {
+    if (m.t < t0 || m.t > tEnd) continue;
+    const x = X(m.t);
+    cctx.strokeStyle = COL.axis; cctx.setLineDash([2, 4]); cctx.lineWidth = 1;
+    cctx.beginPath(); cctx.moveTo(x, padT); cctx.lineTo(x, h - padB); cctx.stroke(); cctx.setLineDash([]);
+    cctx.fillStyle = COL.muted; cctx.font = '9px "Noto Sans KR", system-ui, sans-serif';
+    cctx.textAlign = 'left'; cctx.textBaseline = 'bottom'; cctx.fillText(m.text, x + 2, h - padB - 1);
   }
-  if (!all.length) { vctx.fillStyle = COL.muted; vctx.textAlign = 'center'; vctx.textBaseline = 'middle'; vctx.fillText('후보를 비교하면 곡선이 그려집니다', w / 2, h / 2); }
-  // 오차 요약
-  if (VERIFY.real.length && VERIFY.sim.length) {
-    let se = 0, n = 0; for (const r of VERIFY.real) { const s = VERIFY.sim.find(d => d.rps === r.rps); if (s && r.p95 > 0) { se += Math.abs(s.p95 - r.p95) / r.p95; n++; } }
-    if (n) { vctx.fillStyle = COL.ink2; vctx.textAlign = 'right'; vctx.textBaseline = 'bottom'; vctx.fillText(`p95 평균 상대오차 ${(se / n * 100).toFixed(0)}% (${n}점)`, w - padR, 56); }
-  }
-  // 호버
-  const tip = $('tooltip2');
-  if (VERIFY.hoverX != null && all.length) {
-    const rx = (VERIFY.hoverX - padL) / (w - padL - padR) * maxX;
-    const near = (pts) => pts.length ? pts.reduce((b, d) => Math.abs(d.rps - rx) < Math.abs(b.rps - rx) ? d : b) : null;
-    const r = near(VERIFY.real), s = near(VERIFY.sim);
+  // x축
+  cctx.fillStyle = COL.muted; cctx.font = '9px "Noto Sans KR", system-ui, sans-serif';
+  cctx.textAlign = 'center'; cctx.textBaseline = 'top';
+  const step = N <= 60 ? 10 : N <= 120 ? 20 : 60;
+  for (let s = 0; s <= N; s += step) { const t = Math.floor(t0 / step) * step + s; if (t < 0 || t > tEnd) continue; cctx.fillText(`${Math.round(t)}s`, X(t), h - padB + 2); }
+
+  // 크로스헤어 + 툴팁 — 그 시점의 인스턴스별 값을 한 번에
+  const tip = $('cmpTip');
+  if (CMPV.hoverX != null && CMPV.hoverX > padL) {
+    const tt = t0 + (CMPV.hoverX - padL) / (w - padL - padR) * N;
+    const at = (H) => H.length ? H.reduce((b, d) => Math.abs(d.t - tt) < Math.abs(b.t - tt) ? d : b) : null;
+    const ref = at(anyH), x = X(ref.t);
+    cctx.strokeStyle = COL.ink2; cctx.setLineDash([2, 3]); cctx.lineWidth = 1;
+    cctx.beginPath(); cctx.moveTo(x, padT - 6); cctx.lineTo(x, h - padB); cctx.stroke(); cctx.setLineDash([]);
+    for (const p of rows) for (const { it, i } of zOrder) { const d = at(hists[i]); if (!d) continue;
+      cctx.globalAlpha = it.sel ? 1 : .55;
+      cctx.fillStyle = CK(it); cctx.beginPath(); cctx.arc(x, p.Y(p.get(d)), it.sel ? 3.5 : 2.5, 0, 7); cctx.fill();
+      cctx.strokeStyle = '#fff'; cctx.lineWidth = 1.2; cctx.stroke(); cctx.globalAlpha = 1; }
     tip.style.display = 'block';
-    tip.innerHTML = (r ? `<div class="r"><span><i style="background:${COL.s_real}"></i>실측 ${r.rps}rps</span><span>p50 ${fmt(r.p50)} · p95 ${fmt(r.p95)} ms · 실패 ${(r.err * 100).toFixed(1)}%</span></div>` : '') +
-      (s ? `<div class="r"><span><i style="background:${COL.s_sim}"></i>시뮬 ${s.rps}rps</span><span>p50 ${fmt(s.p50)} · p95 ${fmt(s.p95)} ms · 실패 ${(s.err * 100).toFixed(1)}%</span></div>` : '') +
-      CV.map(c => { const d = near(c.pts); return d ? `<div class="r"><span><i style="background:${c.color}"></i>${c.name} ${d.rps}rps</span><span>p95 ${fmt(d.p95)} ms · 실패 ${(d.err * 100).toFixed(1)}%</span></div>` : ''; }).join('');
-    tip.style.left = Math.min(VERIFY.hoverX + 12, w - tip.offsetWidth - 8) + 'px'; tip.style.top = '28px';
+    // 툴팁은 어차피 이름을 쓰므로, 여기서는 색이 아니라 "지금 고른 것"만 표시한다
+    tip.innerHTML = `<div class="r"><b>t = ${ref.t.toFixed(0)}s</b><span>유입 ${ref.in}/s</span></div>`
+      + list.map((it, i) => { const d = at(hists[i]); return d
+        ? `<div class="r"><span><i style="background:${CK(it)};opacity:${it.sel ? 1 : .35}"></i>`
+          + `<b${it.sel ? '' : ' style="font-weight:400"'}>${it.type}</b></span>`
+          + `<span>CPU ${Math.round((d.cpU || 0) * 100)}% · p95 ${fmt(d.p95)}ms · 완료 ${d.out}/s · 실패 ${d.rej + d.to}/s</span></div>` : ''; }).join('');
+    tip.style.left = Math.min(x + 12, w - tip.offsetWidth - 8) + 'px'; tip.style.top = '6px';
   } else tip.style.display = 'none';
 }
-vf.addEventListener('mousemove', (e) => { VERIFY.hoverX = e.offsetX; }); vf.addEventListener('mouseleave', () => { VERIFY.hoverX = null; });
+cmpc.addEventListener('mousemove', (e) => { CMPV.hoverX = e.offsetX; });
+cmpc.addEventListener('mouseleave', () => { CMPV.hoverX = null; });

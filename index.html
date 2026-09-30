@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ReinforceBean — 서버 내부 단면도</title>
+<title>ReinforceBean — EC2 인스턴스 부하 비교</title>
 <style>
-  /* ── 디자인 토큰 (CDA 대시보드 체계: slate 계열 + 파랑 강조 1색, 각진 모서리, 그림자 없음) ── */
+  /* ── 디자인 토큰: slate 계열 + 파랑 강조 1색, 각진 모서리, 그림자 없음 ── */
   :root {
     color-scheme: light;
     --page:          #ffffff;
@@ -31,19 +31,13 @@
     --warn-soft:     #fdf6e3;
     --warn-border:   #eddba8;
 
-    /* 캔버스 4색: 회색(대기·유입) / 파랑(정상·완료) / 황갈(커넥션 대기·낭비) / 빨강(실패) */
+    /* 캔버스 색: 회색(대기·유입) / 파랑(정상·완료) / 황갈(경합·낭비) / 빨강(실패) */
     --gray:  #8b98a8; --gray-l: #cbd5e1;
     --blue:  #1f6feb; --blue-l: #b6d1fa;
     --orange:#a16207;
     --red:   #b0201a;
-    --c-idle:     #eef2f6;
-    --c-queued:   var(--gray);
-    --c-busy:     var(--blue);
-    --c-waitconn: var(--orange);
-    --c-db:       var(--blue);
-    --c-done:     var(--blue);
-    --c-timeout:  var(--red);
-    --c-retry:    var(--orange);
+    --c-idle: #eef2f6; --c-queued: var(--gray); --c-busy: var(--blue); --c-waitconn: var(--orange);
+    --c-db: var(--blue); --c-done: var(--blue); --c-timeout: var(--red); --c-retry: var(--orange);
     --s-in: var(--gray); --s-out: var(--blue); --s-rej: var(--red); --s-to: var(--red); --s-retry: var(--orange);
     --s-wasted: var(--orange); --s-p50: var(--blue-l); --s-p95: var(--blue);
     --s-sim: var(--blue); --s-real: #16202c;
@@ -52,50 +46,90 @@
   html, body { margin: 0; height: 100%; }
   body { background: var(--page); color: var(--ink);
     font: 13px/1.45 "Noto Sans KR", "Malgun Gothic", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; overflow: hidden; }
+    display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
 
-  /* ── 헤더: 제목 + 인라인 컨트롤 한 줄 ── */
-  header { display: flex; align-items: center; gap: 10px; padding: 5px 12px; border-bottom: 1px solid var(--border); background: var(--surface); }
+  /* ── 헤더: 제목 + 목표 + 재생 컨트롤 한 줄 ── */
+  header { display: flex; align-items: center; gap: 9px; padding: 6px 12px; border-bottom: 1px solid var(--border); background: var(--surface); }
   header h1 { font-size: 14px; margin: 0; font-weight: 700; letter-spacing: -.2px; }
-  header h1 small { color: var(--muted); font-weight: 400; font-size: 11px; margin-left: 8px; }
+  header h1 small { color: var(--muted); font-weight: 400; font-size: 11px; margin-left: 7px; }
   header .spacer { flex: 1; }
-  #demoLog { flex: 1; min-width: 0; font-size: 10.5px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  header > span { font-size: 11px; color: var(--muted); }
+  header span.st { font-size: 11px; color: var(--muted); }
+  header span.st b { color: var(--ink); font-variant-numeric: tabular-nums; }
 
-  /* 3행 × 3열. 맨 윗줄(가운데+오른쪽)은 설정 후보 비교 표가 통째로 쓴다 — 이 도구의 결론이 거기서 나온다. */
-  main { display: grid; grid-template-columns: 236px minmax(0, 1fr) 520px;
-    grid-template-rows: minmax(150px, 0.44fr) minmax(112px, 0.22fr) minmax(0, 0.34fr); gap: 0; min-height: 0; }
-  aside { display: flex; flex-direction: column; overflow: auto; padding: 4px 9px 8px; }
+  /* 3열 × 3행. 왼쪽은 입력, 가운데는 위에서 아래로 「리스트 → 요청 흐름 → 실시간 비교」.
+     고르는 것(리스트)이 맨 위, 고른 결과가 어디서 막히는지(흐름)가 그 밑, 시간에 따른 변화가 맨 아래.
+     오른쪽은 판단에 필요한 것만 — 병목 · 추천 · 모델 보정. */
+  main { display: grid; grid-template-columns: 208px minmax(0, 1fr) 386px;
+    grid-template-rows: minmax(0, 0.38fr) minmax(130px, 0.28fr) minmax(0, 0.34fr); min-height: 0; }
+  aside { display: flex; flex-direction: column; overflow: auto; padding: 5px 9px 8px; }
   #left  { grid-column: 1; grid-row: 1 / 4; border-right: 1px solid var(--border); }
-  #right { grid-column: 3; grid-row: 1 / 4; border-left: 1px solid var(--border); overflow: auto; }
-  #cmpWrap { grid-column: 2; grid-row: 1; min-height: 0; border-bottom: 1px solid var(--border); }
-  #cmpMain { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 5px 8px 5px; }
-  #stageWrap { grid-column: 2; grid-row: 2; margin: 6px 6px 3px; }
-  #chartWrap { grid-column: 2; grid-row: 3; margin: 3px 6px 6px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(230px, 300px); gap: 6px; background: transparent; }
-  #vfWrap { position: relative; background: var(--canvas); border: 1px solid var(--border); overflow: hidden; }
-  #tlWrap, #vfWrap { position: relative; background: var(--canvas); border: 1px solid var(--border); overflow: hidden; }
-  #tlBar { position: absolute; top: 6px; right: 8px; z-index: 1; display: flex; gap: 5px; align-items: center; font-size: 10.5px; color: var(--muted); }
-  #tlBar select { padding: 1px 4px; font-size: 10.5px; }
+  #right { grid-column: 3; grid-row: 1 / 4; border-left: 1px solid var(--border); }
+  #stageWrap { grid-column: 2; grid-row: 2; margin: 3px 6px 3px; }
+  #listWrap  { grid-column: 2; grid-row: 1; margin: 6px 6px 3px; display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    background: var(--surface); border: 1px solid var(--border); min-height: 0; }
+  #cmpWrap   { grid-column: 2; grid-row: 3; margin: 3px 6px 6px; }
 
-  /* ── 섹션 제목: 작고 굵게, 얇은 밑줄 ── */
-  .col-title { display: flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 700; color: var(--ink);
-    margin: 2px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
-  .badge { display: inline-flex; align-items: center; justify-content: center; min-width: 15px; height: 15px; padding: 0 3px;
-    background: var(--surface-2); color: var(--ink-2); font-size: 9.5px; font-weight: 700; border: 1px solid var(--border); }
-  .badge.sub { background: var(--surface); }
-  .panel { padding: 0 0 4px; margin-bottom: 2px; border-bottom: 1px solid var(--grid); min-height: 0; }
-  aside .panel { flex: none; }   /* 세로 flex 안에서 눌려 내용이 겹치지 않도록 */
+  /* ── 가운데 리스트: 왼쪽 「설정 시나리오」 · 오른쪽 「인스턴스 비교」 ──
+     둘 다 반쪽 폭이라 값을 옆으로 늘어놓을 수 없다. 그래서 행을 두 줄로 쓴다 —
+     윗줄은 판정에 쓰는 결과, 아랫줄은 그 결과가 나온 조건. */
+  .listcol { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .listcol + .listcol { border-left: 1px solid var(--border); }
+  .listhead { display: flex; align-items: center; gap: 5px; padding: 4px 7px; flex: none;
+    border-bottom: 1px solid var(--border); background: var(--surface-soft);
+    font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; }
+  .listhead b { font-size: 11px; color: var(--ink); flex: none; }
+  .listhead .spacer { flex: 1; }
+  .listhead > span { overflow: hidden; text-overflow: ellipsis; }
+  .listhead input[type=text] { width: 84px; flex: none; }
+  .listhead button { flex: none; padding: 1px 6px; font-size: 10px; }
+  .listbody { flex: 1; min-height: 0; overflow: auto; padding: 4px 6px 6px; }
+  /* 아주 넓은 화면에서 이름 칸만 늘어나 숫자가 멀어지지 않게 — 읽는 폭을 묶어 둔다 */
+  #instTable table.ctab { max-width: 700px; }
+  #cfgTable { max-width: 1180px; }
+
+  /* 두 줄짜리 행: 아랫줄(.sub)은 조건·근거 */
+  tr.sub td { padding: 0 4px 4px; border-bottom: 1px solid var(--border); }
+
+  /* 인셀 차트 — 셀 하나가 값 하나. 배경이 칠해진 길이가 곧 그 값의 크기다.
+     설정 칸은 슬라이더 최댓값 대비, 결과 칸은 목표치 대비로 칠한다. 숫자를 읽기 전에 크기가 먼저 보인다. */
+  table.stab td.cell { position: relative; overflow: hidden; text-align: right; padding: 3px 4px; }
+  table.stab td.cell .fill { position: absolute; left: 0; top: 1px; bottom: 1px; background: #e2eaf4; }
+  table.stab td.cell.d .fill { background: var(--accent-border); }
+  table.stab td.cell.hot .fill { background: #f5d9d7; }
+  table.stab td.cell.warm .fill { background: #f7ecd2; }
+  table.stab td.cell b, table.stab td.cell em { position: relative; }
+  table.stab td.cell b { font-weight: 600; color: var(--ink-2); font-size: 10.5px; }
+  table.stab td.cell.d b { color: var(--accent-strong); font-weight: 700; }
+  table.stab td.cell.hot b { color: var(--bad); font-weight: 700; }
+  table.stab td.cell.zero b { color: var(--muted); font-weight: 400; }
+  table.stab td.cell em { font-style: normal; font-size: 9px; margin-left: 3px; font-weight: 700; }
+  table.stab em.up { color: var(--bad); }
+  table.stab em.dn { color: var(--accent-strong); }
+  .pill.ok { color: var(--accent-strong); border-color: var(--accent-border); background: var(--accent-soft); }
+  .listhead .fbtn { border: 1px solid var(--border-strong); background: var(--surface); padding: 1px 6px; font-size: 10px; }
+  .listhead .fbtn.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-strong); }
+  .chips { display: flex; flex-wrap: wrap; gap: 1px 7px; font-size: 9.5px; color: var(--muted); line-height: 14px; }
+  .chips b { color: var(--ink-2); font-weight: 600; }
+  .chips .hi { color: var(--accent-strong); font-weight: 700; }
+  .chips .wr { color: var(--warn); font-weight: 700; }
+  .chips .bd { color: var(--bad); font-weight: 700; }
+  .chips .mini { display: inline-block; width: 22px; height: 4px; background: var(--surface-2); vertical-align: middle; margin-left: 2px; }
+  .chips .mini i { display: block; height: 100%; background: var(--accent); }
+  .chips .mini.hot i { background: var(--bad); }
+
+  /* ── 패널 ── */
+  .panel { padding: 0 0 6px; margin-bottom: 6px; border-bottom: 1px solid var(--grid); min-height: 0; flex: none; }
   .panel:last-child { border-bottom: 0; }
-  .panel h2 { display: flex; justify-content: space-between; align-items: center; gap: 6px;
-    font-size: 11px; font-weight: 700; color: var(--ink); margin: 3px 0 2px; }
-  .panel h2 .badge { margin-left: 4px; }
+  .panel h2 { display: flex; justify-content: space-between; align-items: baseline; gap: 6px;
+    font-size: 11px; font-weight: 700; color: var(--ink); margin: 2px 0 5px; }
+  .panel h2 small { font-weight: 400; font-size: 9.5px; color: var(--muted); }
 
   /* ── 입력 ── */
-  .ctl { margin-bottom: 4px; }
-  .ctl label { display: flex; justify-content: space-between; align-items: baseline; color: var(--ink-2); margin-bottom: 0; font-size: 11px; line-height: 15px; }
+  .ctl { margin-bottom: 5px; }
+  .ctl label { display: flex; justify-content: space-between; align-items: baseline; color: var(--ink-2); font-size: 11px; line-height: 15px; }
   .ctl label b { color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 700; font-size: 12px; }
   .ctl.disabled { opacity: .4; pointer-events: none; }
-  .rng { display: none; }
   input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 14px; background: transparent; margin: 0; }
   input[type=range]::-webkit-slider-runnable-track { height: 3px; background: var(--border-strong); }
   input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 11px; height: 11px; background: var(--accent); border: 0; margin-top: -4px; cursor: pointer; }
@@ -103,450 +137,223 @@
   input[type=range]::-moz-range-thumb { width: 11px; height: 11px; border-radius: 0; background: var(--accent); border: 0; cursor: pointer; }
   select, button, input[type=number], input[type=text] { background: var(--surface); color: var(--ink);
     border: 1px solid var(--border-strong); border-radius: 0; padding: 2px 6px; font: inherit; font-size: 11px; }
-  select { padding: 2px 4px; }
+  select { padding: 2px 4px; width: 100%; }
   button { cursor: pointer; color: var(--ink-2); font-weight: 600; padding: 2px 8px; line-height: 16px; }
   button:hover { background: var(--surface-hover); color: var(--ink); }
   button:disabled { opacity: .45; cursor: default; }
   button.primary { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-strong); }
   button.primary:hover { background: #ddeafd; }
-  button.tab { border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); padding: 2px 8px; }
-  button.tab.on { color: var(--ink); border-bottom-color: var(--accent); }
-  .row { display: flex; gap: 4px; } .row > * { flex: 1; min-width: 0; }
-  .row button { padding: 2px 4px; font-size: 11px; white-space: nowrap; }
-  .check { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--ink-2); }
+  .row { display: flex; gap: 4px; margin-bottom: 4px; } .row > * { flex: 1; min-width: 0; }
+  .row button { padding: 2px 4px; white-space: nowrap; }
+  .slo-inline { display: flex; align-items: center; gap: 3px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .slo-inline input { width: 50px; padding: 1px 4px; text-align: right; }
+  .note { font-size: 10.5px; color: var(--muted); line-height: 1.45; margin-top: 4px; }
+  .kv { display: flex; flex-wrap: wrap; gap: 1px 10px; font-size: 10px; color: var(--muted); margin-bottom: 4px; }
+  .kv b { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .none { font-size: 10.5px; color: var(--muted); padding: 6px 2px; }
+
+  /* ── 인스턴스 목록 (왼쪽) ── */
+  .inst { display: flex; align-items: center; gap: 4px; padding: 3px 3px; border-bottom: 1px solid var(--grid); cursor: pointer; font-size: 11px; flex-wrap: wrap; }
+  .inst:hover { background: var(--surface-hover); }
+  .inst.on { background: var(--accent-soft); }
+  .inst b { color: var(--ink); font-size: 11px; }
+  .inst .spec { flex: 1 0 100%; color: var(--muted); font-size: 9.5px; font-variant-numeric: tabular-nums; padding-left: 12px; }
+  .inst .money { color: var(--ink-2); font-size: 10px; font-variant-numeric: tabular-nums; margin-left: auto; }
+  .inst .del { border: 0; background: transparent; color: var(--muted); padding: 0 2px; font-size: 13px; line-height: 1; font-weight: 400; flex: none; }
+  .inst .del:hover { color: var(--red); background: transparent; }
+  .cdot { display: inline-block; width: 8px; height: 8px; flex: none; vertical-align: middle; }
 
   /* ── 지표 타일 ── */
-  .tiles { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; }
-  .tile { background: var(--surface-soft); border: 1px solid var(--grid); padding: 3px 6px; }
-  .tile .k { color: var(--muted); font-size: 9.5px; font-weight: 600; }
-  .tile .v { font-size: 13px; font-weight: 700; margin-top: 0; font-variant-numeric: tabular-nums; }
+  .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; }
+  .tile { background: var(--surface-soft); border: 1px solid var(--grid); padding: 2px 5px; }
+  .tile .k { color: var(--muted); font-size: 9px; font-weight: 600; white-space: nowrap; }
+  .tile .v { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .tile .v small { font-size: 9.5px; color: var(--muted); font-weight: 400; margin-left: 2px; }
-  .tiles.c4 { grid-template-columns: repeat(4, 1fr); gap: 3px; }
-  .tiles.c4 .tile { padding: 1px 4px; }
-  .tiles.c4 .tile .k { font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .tiles.c4 .tile .v { font-size: 13px; }
 
   /* ── 병목 판정 ── */
-  #bottleneck { display: flex; gap: 8px; align-items: flex-start; padding: 5px 8px; background: var(--surface-soft);
-    border: 1px solid var(--grid); border-left: 3px solid var(--accent); margin-bottom: 6px; }
+  #bottleneck { padding: 5px 8px; background: var(--surface-soft); border: 1px solid var(--grid);
+    border-left: 3px solid var(--accent); margin-bottom: 5px; }
   #bottleneck .t { font-weight: 700; font-size: 12px; }
+  #bottleneck .d { font-size: 10.5px; color: var(--ink-2); line-height: 1.4; margin-top: 2px; max-height: 58px; overflow: auto; }
   #bottleneck[data-level=warn] { border-left-color: var(--warn); background: var(--warn-soft); }
   #bottleneck[data-level=bad]  { border-left-color: var(--bad); background: var(--bad-soft); }
-  #explain { font-size: 11px; color: var(--ink-2); line-height: 1.45; max-height: 150px; overflow: auto; }
-  #explain b { color: var(--ink); }
-  #explain .step { margin: 3px 0; padding-left: 8px; border-left: 2px solid var(--grid); }
-  #explain .step.now { border-left-color: var(--accent); color: var(--ink); }
 
-  /* ── 표: 촘촘한 데이터 그리드 ── */
-  table.t { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-  table.t th { font-size: 9.5px; font-weight: 600; color: var(--ink-2); background: var(--surface-2);
+  /* ── 표 ── */
+  table.t { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; margin-top: 4px; }
+  table.t th { font-size: 9px; font-weight: 600; color: var(--ink-2); background: var(--surface-2);
     padding: 3px 4px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
   table.t td { font-size: 10.5px; color: var(--ink-2); padding: 2px 4px; border-bottom: 1px solid var(--grid); text-align: right; white-space: nowrap; }
   table.t td:first-child, table.t th:first-child { text-align: left; }
-  table.t td:last-child { color: var(--ink); }
-  table.t tr.pass td { color: var(--ink); } table.t tr.fail td { opacity: .5; }
-  table.t tr.best td { background: var(--accent-soft); color: var(--accent-strong); font-weight: 600; }
-  table.t tr.pick { cursor: pointer; } table.t tr.pick:hover td { background: var(--surface-hover); }
-  .slo-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 6px; margin-bottom: 6px; }
-  .slo-grid label { font-size: 9.5px; font-weight: 600; color: var(--muted); display: block; margin-bottom: 1px; }
-  .slo-grid input { width: 100%; }
-  .note { font-size: 10.5px; color: var(--muted); margin-top: 5px; line-height: 1.45; }
 
-  /* ── 작업 구성 (A3) ── */
-  .mixrow { margin-bottom: 6px; padding-bottom: 5px; border-bottom: 1px solid var(--grid); }
-  .mixrow:last-child { border-bottom: 0; }
-  .mixrow > label { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--ink-2); margin-bottom: 1px; }
-  .mixrow > label b { color: var(--ink); font-variant-numeric: tabular-nums; }
-  .mixrow .mtimes { font-size: 9.5px; color: var(--muted); display: flex; align-items: center; gap: 3px; margin-top: 1px; }
-  .mixrow .mtimes input { width: 42px; padding: 0 3px; font-size: 9.5px; }
-  .mixrow.off { opacity: .35; }
-
-  /* ── 태그 칩 ── */
-  .est, .plan .tag { display: inline-block; font-size: 9px; font-weight: 700; padding: 0 4px; line-height: 14px;
-    border: 1px solid transparent; vertical-align: 1px; }
-  .est { background: var(--warn-soft); color: var(--warn); border-color: var(--warn-border); margin-left: 4px; }
-  .plan .tag { margin-right: 5px; }
-  .tag.cfg { background: var(--accent-soft); color: var(--accent-strong); border-color: var(--accent-border); }
-  .tag.scale { background: var(--warn-soft); color: var(--warn); border-color: var(--warn-border); }
-  .tag.query { background: var(--surface-2); color: var(--ink-2); border-color: var(--border); }
-  .tag.base { background: var(--surface-2); color: var(--muted); border-color: var(--border); }
-
-  /* ── 단계 표시줄: 분절형 칩 ── */
-  #steps { display: flex; align-items: center; gap: 0; border-bottom: 1px solid var(--border); background: var(--surface-soft); padding: 4px 12px; overflow-x: auto; }
-  .step { display: flex; align-items: center; gap: 5px; border: 1px solid var(--border-strong); border-right-width: 0;
-    background: var(--surface); color: var(--ink-2); padding: 2px 9px; font-size: 11px; font-weight: 600; white-space: nowrap; line-height: 16px; }
-  .step:last-of-type { border-right-width: 1px; }
-  .step:hover { background: var(--surface-hover); color: var(--ink); }
-  .step .n { display: inline-flex; align-items: center; justify-content: center; width: 13px; height: 13px;
-    background: var(--surface-2); color: var(--ink-2); font-size: 9px; font-weight: 700; flex: none; }
-  .step .hint { font-weight: 400; font-size: 10px; color: var(--muted); }
-  .step.now { color: var(--accent-strong); background: var(--accent-soft); border-color: var(--accent); position: relative; z-index: 1; }
-  .step.now .n { background: var(--accent); color: #fff; }
-  .step.done { color: var(--ink); }
-  .step.done .n { background: var(--accent); color: #fff; }
-  .step-sep { display: none; }
-
-  @keyframes flash { 0%,100% { outline-color: rgba(31,111,235,0); } 25%,75% { outline-color: rgba(31,111,235,.5); } }
-  .flash { animation: flash 1.4s ease-in-out 1; outline: 2px solid rgba(31,111,235,0); outline-offset: 1px; }
-
-  /* ── 시작 안내 ── */
-  #guide { background: var(--accent-soft); border: 1px solid var(--accent-border); padding: 6px 8px; margin-bottom: 7px; }
-  #guide .gb { font-size: 11px; color: var(--ink-2); line-height: 1.45; margin-bottom: 6px; }
-  #guide .note { margin-top: 5px; }
-  #guide.done { background: var(--surface-soft); border-color: var(--border); }
-  #guide.done .gb, #guide.done #demoLog { display: none; }
-  #guide.done { padding: 5px 8px; }
-
-  details.adv { border: 1px solid var(--grid); padding: 5px 8px; margin-bottom: 8px; background: var(--surface-soft); }
-  details.adv > summary { cursor: pointer; font-size: 10.5px; color: var(--ink-2); font-weight: 700; list-style: none; }
-  details.adv > summary::-webkit-details-marker { display: none; }
-  details.adv > summary::before { content: '▸ '; color: var(--muted); }
-  details.adv[open] > summary::before { content: '▾ '; }
-  details.adv > div:first-of-type { margin-top: 6px; }
-
-  button.next { position: relative; }
-  button.next::after { content: '← 다음'; position: absolute; left: 100%; margin-left: 6px; white-space: nowrap;
-    font-size: 10px; font-weight: 700; color: var(--accent); }
-  .todo { font-size: 10.5px; color: var(--ink-2); background: var(--accent-soft); border-left: 2px solid var(--accent);
-    padding: 4px 7px; margin-bottom: 6px; line-height: 1.45; }
-
-  /* ── 간결 모드(기본): 설명 문장을 숨기고 숫자만 남긴다 ── */
-  body.lean .todo, body.lean .plan .pw, body.lean .why .ww, body.lean #guide .gb, body.lean .note.hint, body.lean .hint { display: none; }
-  body.lean .why { padding: 2px 0; }
-  body.lean .plan { padding: 4px 7px; margin-bottom: 3px; }
-  body.lean .panel { padding-bottom: 5px; }
-  #proseToggle { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); cursor: pointer; user-select: none; }
-  #proseToggle input { margin: 0; }
-
-  /* ── 개선안 카드 ── */
-  .plan { border: 1px solid var(--grid); border-left: 3px solid var(--border-strong); padding: 5px 7px; margin-bottom: 4px; background: var(--surface); }
-  .plan.pass { border-left-color: var(--accent); }
-  .plan.fail { border-left-color: var(--bad); }
-  .plan.pick { border-left-color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); }
-  .plan .ph { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; font-size: 11.5px; font-weight: 700; color: var(--ink); }
-  .plan .pm { font-size: 10.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; margin-top: 1px; }
-  .plan .pw { font-size: 10px; color: var(--muted); line-height: 1.4; margin-top: 3px; }
-
-  /* ── 근거 사슬 ── */
-  .res { max-height: 62px; overflow: auto; }
-  .kv { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 10px; color: var(--muted); margin-top: 4px; }
-  .kv b { color: var(--ink-2); font-variant-numeric: tabular-nums; }
-  .inl { font-size: 9.5px; font-weight: 400; color: var(--muted); display: flex; align-items: center; gap: 3px; }
-  .inl input { width: 42px; padding: 0 3px; font-size: 10px; text-align: right; }
-  .slo-grid.c4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
-  /* ── 비교 표 헤드: 제목 · 필터 칩 · SLO 인라인 입력 ── */
-  #cmpHead { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; flex-wrap: wrap; }
-  #cmpHead h2 { font-size: 12px; font-weight: 700; margin: 0; display: flex; align-items: center; gap: 5px; }
-  #cmpHead .count { font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .chips { display: flex; gap: 2px; }
-  .chip { border: 1px solid var(--border-strong); background: var(--surface); color: var(--ink-2);
-    font-size: 10.5px; font-weight: 600; padding: 1px 7px; line-height: 16px; cursor: pointer; }
-  .chip:hover { background: var(--surface-hover); }
-  .chip.on { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent-strong); }
-  .slo-inline { display: flex; align-items: center; gap: 3px; font-size: 10.5px; color: var(--muted); white-space: nowrap; }
-  .slo-inline input { width: 52px; padding: 1px 4px; font-size: 10.5px; text-align: right; }
-  #cmpScroll { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--border); background: var(--surface); }
-  #candSay { margin-top: 3px; font-size: 11px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
-  /* ── 비교 표 본체: 고정 헤더 · 고정 첫 열 · 셀 농도 · 기준 대비 ── */
   table.ctab { width: 100%; border-collapse: separate; border-spacing: 0; font-variant-numeric: tabular-nums; }
-  table.ctab th { position: sticky; top: 0; z-index: 2; background: var(--surface-2); font-size: 9.5px; font-weight: 600;
-    color: var(--ink-2); padding: 4px 6px; border-bottom: 1px solid var(--border-strong); text-align: right; white-space: nowrap; }
-  table.ctab th.name { left: 0; z-index: 3; text-align: left; }
-  table.ctab td { font-size: 11px; color: var(--ink-2); padding: 3px 6px; border-bottom: 1px solid var(--grid);
-    text-align: right; white-space: nowrap; }
-  table.ctab td.name { position: sticky; left: 0; z-index: 1; text-align: left; background: var(--surface); color: var(--ink); }
+  table.ctab th { background: var(--surface-2); font-size: 9px; font-weight: 600; color: var(--ink-2);
+    padding: 3px 4px; border-bottom: 1px solid var(--border-strong); text-align: right; white-space: nowrap; }
+  table.ctab th.name { text-align: left; }
+  table.ctab td { font-size: 10.5px; color: var(--ink-2); padding: 3px 3px; border-bottom: 1px solid var(--grid);
+    text-align: right; white-space: nowrap; background-repeat: no-repeat; }
+  table.ctab td.name { text-align: left; color: var(--ink); font-weight: 600; }
   table.ctab td.sep, table.ctab th.sep { border-left: 1px solid var(--border); }
-  table.ctab tbody tr { cursor: pointer; }
-  table.ctab tbody tr:hover td { background: var(--surface-hover); }
-  table.ctab tr.base td { background: var(--surface-soft); }
-  table.ctab tr.base td.name { background: var(--surface-soft); font-weight: 700; }
-  table.ctab tr.off td { opacity: .4; }
-  table.ctab tr.best td.knee, table.ctab tr.best td.cost { outline: 1px solid var(--accent-border); outline-offset: -1px; font-weight: 700; color: var(--accent-strong); }
   table.ctab td.big { font-weight: 700; color: var(--ink); }
-  .dlt { font-size: 9px; margin-left: 3px; font-weight: 600; }
-  .dlt.up { color: var(--bad); } .dlt.dn { color: var(--accent); } .dlt.eq { color: var(--muted); }
-  .pill { display: inline-block; font-size: 9.5px; font-weight: 700; padding: 0 5px; border: 1px solid; line-height: 15px; }
-  .pill.ok { color: var(--accent-strong); border-color: var(--accent-border); background: var(--accent-soft); }
+  table.ctab tbody tr { cursor: pointer; }
+  table.ctab tbody tr:hover td { background-color: var(--surface-hover); }
+  table.ctab tr.sel td { box-shadow: inset 0 -1px 0 var(--accent); }
+  .pill { display: inline-block; font-size: 9px; font-weight: 700; padding: 0 4px; border: 1px solid; line-height: 14px; }
   .pill.no { color: var(--bad); border-color: #eccfcd; background: var(--bad-soft); }
-  .tagH { display: inline-block; width: 13px; height: 13px; line-height: 12px; text-align: center; font-size: 9px; font-weight: 700;
-    border: 1px solid var(--border-strong); color: var(--ink-2); background: var(--surface-2); margin-right: 3px; }
-
-  /* ── 슬라이더 아래 후보 위치 눈금 (지금 값이 다른 후보 대비 어디인지) ── */
-  .ticks { position: relative; height: 7px; margin: -2px 0 0; }
-  .ticks i { position: absolute; top: 0; width: 2px; height: 5px; margin-left: -1px; }
-
-
-  /* ── 하단 재생 바 ── */
-  #playbar { display: flex; align-items: center; gap: 8px; padding: 3px 10px; border-top: 1px solid var(--border);
-    background: var(--surface); font-size: 11px; color: var(--muted); }
-  #playbar b { color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 700; }
-  #scTrack { flex: 1; height: 4px; background: var(--surface-2); border: 1px solid var(--grid); position: relative; min-width: 80px; }
-  #scFill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); width: 0; }
-  #scMarks { position: absolute; left: 0; right: 0; top: -3px; bottom: -3px; }
-  #scMarks i { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--border-strong); }
-
-  /* ── 설정 후보 카드 (A4) ── */
-  .cand { display: flex; align-items: center; gap: 4px; padding: 1px 3px; border-bottom: 1px solid var(--grid); }
-  .cand:hover { background: var(--surface-hover); }
-  .cand .cName { flex: 1; min-width: 0; border: 0; background: transparent; font-size: 11px; font-weight: 600; color: var(--ink); padding: 1px 2px; }
-  .cand .cName:focus { background: var(--surface); outline: 1px solid var(--border-strong); }
-  .cand .cspec { color: var(--muted); font-size: 9.5px; font-variant-numeric: tabular-nums; white-space: nowrap; cursor: pointer; }
-  .cand .cDel { border: 0; background: transparent; color: var(--muted); padding: 0 2px; font-size: 13px; line-height: 1; font-weight: 400; }
-  .cand .cDel:hover { color: var(--red); background: transparent; }
-  #candList { margin: 3px 0; }
-  .cdot { display: inline-block; width: 8px; height: 8px; flex: none; margin-right: 3px; vertical-align: middle; }
-  table.cmp { font-size: 10.5px; white-space: nowrap; }
-  ul.say { margin: 2px 0 6px; padding-left: 15px; font-size: 11.5px; color: var(--ink-2); line-height: 1.55; }
-  ul.say li { margin-bottom: 4px; }
-  .why { display: grid; grid-template-columns: 70px 1fr; gap: 0 8px; padding: 4px 0; border-bottom: 1px solid var(--grid); }
-  .why .wk { font-size: 9.5px; font-weight: 600; color: var(--muted); }
-  .why .wv { font-size: 11.5px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; }
-  .why .ww { grid-column: 2; font-size: 10px; color: var(--ink-2); line-height: 1.4; margin-top: 1px; }
-  .why b { color: var(--ink); }
+  .pill.warn { color: var(--warn); border-color: var(--warn-border); background: var(--warn-soft); }
 
   /* ── 캔버스 ── */
-  #stage, #timeline, #verify { width: 100%; height: 100%; display: block; }
-  .canvas-wrap { position: relative; padding: 0; overflow: hidden; background: var(--canvas); border: 1px solid var(--border); }
-  .canvas-title { position: absolute; top: 5px; left: 9px; z-index: 1; display: flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 700; color: var(--ink); }
-  #tooltip, #tooltip2 { position: absolute; pointer-events: none; display: none; background: var(--surface); border: 1px solid var(--border-strong);
+  #stage, #cmp { width: 100%; height: 100%; display: block; }
+  .canvas-wrap { position: relative; overflow: hidden; background: var(--canvas); border: 1px solid var(--border); }
+  .canvas-title { position: absolute; top: 5px; left: 9px; z-index: 1; font-size: 11px; font-weight: 700; color: var(--ink); }
+  .canvas-title span { font-weight: 400; color: var(--muted); font-size: 10px; margin-left: 5px; }
+  #cmpTip { position: absolute; pointer-events: none; display: none; background: var(--surface); border: 1px solid var(--border-strong);
     padding: 4px 7px; font-size: 10.5px; white-space: nowrap; font-variant-numeric: tabular-nums; z-index: 2; box-shadow: 0 2px 8px rgba(16,24,40,.1); }
-  #tooltip .r, #tooltip2 .r { display: flex; justify-content: space-between; gap: 12px; }
-  #tooltip i, #tooltip2 i { display: inline-block; width: 8px; height: 8px; margin-right: 5px; }
-  #verifyBar { position: absolute; top: 5px; left: 9px; right: 9px; display: flex; gap: 4px; align-items: center; z-index: 1; font-size: 10.5px; color: var(--muted); flex-wrap: wrap; }
-  #verifyBar input[type=file] { display: none; }
-  #verifyBar button { padding: 1px 6px; font-size: 10.5px; }
-  progress { width: 100%; height: 4px; accent-color: var(--accent); }
+  #cmpTip .r { display: flex; justify-content: space-between; gap: 12px; }
+  #cmpTip i { display: inline-block; width: 8px; height: 8px; margin-right: 5px; }
 
-  /* ── D 열 아코디언 ── */
-  #right .panel.acc > h2 { cursor: pointer; user-select: none; padding: 2px 0; }
-  #right .panel.acc > h2::before { content: '▾'; color: var(--muted); font-size: 9px; margin-right: 4px; }
-  #right .panel.acc.closed > h2::before { content: '▸'; }
-  #right .panel.acc.closed > h2 { color: var(--ink-2); font-weight: 600; }
-  #right .panel.acc.closed > :not(h2) { display: none; }
-  #right .panel.acc.closed { border-bottom-color: var(--grid); margin-bottom: 0; padding: 0; }
-  #right .panel.acc.closed > h2 { margin: 2px 0; font-size: 11px; }
-  #right .panel.acc > h2 .tick { font-size: 9px; font-weight: 700; color: var(--accent); margin-left: auto; margin-right: 4px;
-    background: var(--accent-soft); border: 1px solid var(--accent-border); padding: 0 3px; line-height: 13px; }
-  #right > .panel { flex: none; }
-  #right .panel.acc:not(.closed) { flex: 1 1 auto; min-height: 90px; display: flex; flex-direction: column; }
-  #right .panel.acc > h2 { flex: none; }
-  #right .panel.acc > .body { min-height: 0; }
-  #right .panel.acc:not(.closed) > .body { flex: 1 1 auto; overflow: auto; }
+  /* ── 설정 시나리오 표 ── */
+  table.stab { width: 100%; border-collapse: separate; border-spacing: 0; font-variant-numeric: tabular-nums; }
+  table.stab th { position: sticky; top: 0; background: var(--surface-2); font-size: 9.5px; font-weight: 600; color: var(--ink-2);
+    padding: 4px 4px; border-bottom: 1px solid var(--border-strong); text-align: right; white-space: nowrap; }
+  table.stab th.l, table.stab td.l { text-align: left; }
+  table.stab td { font-size: 11px; color: var(--ink-2); padding: 3px 4px; border-bottom: 1px solid var(--grid); text-align: right; white-space: nowrap; }
+  table.stab td.name { color: var(--ink); font-weight: 600; max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
+  table.stab td.sep, table.stab th.sep { border-left: 1px solid var(--border); }
+  table.stab tr.now td { background: var(--accent-soft); }
+  table.stab tr:hover td { background: var(--surface-hover); }
+  table.stab tr.now:hover td { background: #ddeafd; }
+  table.stab td.diff { color: var(--accent-strong); font-weight: 700; background: var(--accent-soft); }
+  table.stab td .act { display: flex; gap: 3px; justify-content: flex-end; }
+  table.stab td .act button { font-size: 10px; padding: 1px 5px; }
+  table.stab td.pv { color: var(--muted); }
+  table.stab td.pv.on { color: var(--ink); font-weight: 700; }
+  table.stab td.pv.bad { color: var(--bad); font-weight: 700; }
+
+  /* ── 추천 (우측) — 결론 한 줄이 아니라 근거·대안·값까지 ── */
+  #advice .head { display: flex; align-items: baseline; gap: 6px; padding: 5px 8px; background: var(--accent-soft);
+    border: 1px solid var(--accent-border); border-left: 3px solid var(--accent); }
+  #advice .head b { font-size: 14px; color: var(--ink); }
+  #advice .head .sub { font-size: 10.5px; color: var(--ink-2); }
+  #advice .head .cost { margin-left: auto; font-size: 12px; font-weight: 700; color: var(--accent-strong); font-variant-numeric: tabular-nums; }
+  #advice.bad .head { background: var(--bad-soft); border-color: #eccfcd; border-left-color: var(--bad); }
+  #advice.bad .head b { color: var(--bad); }
+  #advice .head { padding: 8px 10px; }
+  #advice .head b { font-size: 16px; }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>ReinforceBean</h1>
-  <button class="primary" id="btnDemo">예제 실행</button>
-  <span id="demoLog"></span>
+  <h1>ReinforceBean <small>부하 테스트 중 — 어느 EC2 인스턴스면 충분한가</small></h1>
   <div class="spacer"></div>
-  <label id="proseToggle" title="각 항목의 해설 문장을 보여줍니다"><input type="checkbox" id="prose"> 설명</label>
+  <span class="slo-inline">목표 p95 <input type="number" id="sloP95" value="300" min="10" step="10"> ms · 실패 <input type="number" id="sloErr" value="1" min="0" step="0.5"> %</span>
+  <button id="btnPause">일시정지</button>
+  <button id="btnReset">처음으로</button>
+  <span class="st">시뮬 <b id="simClock">0.0s</b></span>
 </header>
 
-<!-- 무엇을 어떤 순서로 해야 하는지 — 누르면 해당 패널로 이동하고 잠깐 반짝인다 -->
-<nav id="steps">
-  <button class="step" data-go="left"      data-key="cond">   <span class="n"><span class="lbl">1</span></span> 조건</button>
-  <span class="step-sep">›</span>
-  <button class="step" data-go="bottleneck" data-key="diag">  <span class="n"><span class="lbl">2</span></span> 병목</button>
-  <span class="step-sep">›</span>
-  <button class="step" data-go="candOut"    data-key="cand">  <span class="n"><span class="lbl">3</span></span> 설정 비교</button>
-  <span class="step-sep">›</span>
-  <button class="step" data-go="recoOut"    data-key="reco">  <span class="n"><span class="lbl">4</span></span> 최소 자원</button>
-  <span class="step-sep">›</span>
-  <button class="step" data-go="cmpOut"     data-key="cmp">   <span class="n"><span class="lbl">5</span></span> 개선안</button>
-  <span class="step-sep">›</span>
-  <button class="step" data-go="calibOut"   data-key="calib"> <span class="n"><span class="lbl">6</span></span> 보정</button>
-  <span class="step-sep">›</span>
-  <button class="step" data-go="infraOut"   data-key="infra"> <span class="n"><span class="lbl">7</span></span> 인프라</button>
-  <span class="step-sep">›</span>
-  <button class="step" data-go="reportOut"  data-key="save">  <span class="n"><span class="lbl">8</span></span> 저장</button>
-</nav>
-
 <main>
-  <!-- ─────────── D9: 설정 후보 비교 — 화면의 주인공 ───────────
-       여러 서버 설정을 한 표에 놓고 "같은 트래픽에서 어느 쪽이 몇 rps까지 버티나"를 비교한다.
-       첫 행이 기준이고, 나머지 행의 숫자에는 기준 대비 증감이 붙는다. ──────────── -->
-  <section id="cmpWrap">
-    <div id="cmpMain">
-      <div id="cmpHead">
-        <h2>후보 비교 <span class="badge sub">D9</span></h2>
-        <span class="count" id="cmpCount">후보 0벌</span>
-        <div class="chips" id="cmpChips">
-          <button class="chip on" data-filter="all">전체</button>
-          <button class="chip" data-filter="pass">SLO 만족</button>
-          <button class="chip" data-filter="fail">미달</button>
-          <button class="chip" data-filter="on">선택만</button>
-        </div>
-        <span style="flex:1"></span>
-        <span class="slo-inline" title="이 세 칸이 D4·D6·D5·D9 전체의 기준입니다">
-          피크 <input type="number" id="sloRps" value="400" min="10" step="10"> rps ·
-          목표 p95 <input type="number" id="sloP95" value="300" min="10" step="10"> ms ·
-          실패 <input type="number" id="sloErr" value="1" min="0" step="0.5"> %
-        </span>
-        <progress id="candProg" value="0" max="1" style="display:none;width:70px"></progress>
-        <progress id="cmpProg" value="0" max="1" style="display:none;width:70px"></progress>
-        <button class="primary" id="btnCandCmp">후보 비교</button>
-        <button id="btnCompare" title="증설 · 설정 · 쿼리 개선을 자동으로 만들어 같은 조건에서 비교">개선안 <span class="badge sub">D6</span></button>
-      </div>
-      <div id="cmpScroll">
-        <div id="candOut" style="padding:10px" class="note">후보 · 비교 실행</div>
-        <div id="cmpOut" class="note" style="display:none;padding:10px"></div>
-      </div>
-      <div id="candSay"></div>
-    </div>
-  </section>
-
-  <!-- ─────────── A: 입력 ─────────── -->
+  <!-- ─────────── 입력: 트래픽 · 공통 서버 설정 · 비교할 인스턴스 ─────────── -->
   <aside id="left">
     <div class="panel">
-      <h2>트래픽 <span class="badge sub">A2</span></h2>
-      <div class="ctl"><select id="scenario" style="width:100%"></select></div>
-      <div class="ctl" id="ctlRps"><label>유입 <b id="rpsVal">100</b> rps</label><input type="range" id="rps" min="0" max="800" step="10" value="100"></div>
-      <div class="ctl"><select id="dataset" style="width:100%"><option value="">공개 트래픽 곡선</option></select></div>
-      <div class="ctl"><label>평균 유입 <b><span id="avgRpsVal">150</span> rps</b></label><input type="range" id="avgRps" min="10" max="600" step="10" value="150"></div>
-      <div id="dsInfo" class="note hint"></div>
+      <h2>부하</h2>
+      <div class="ctl"><select id="scenario"></select></div>
+      <div class="ctl" id="ctlRps"><label><span id="rpsLbl">유입</span> <b id="rpsVal">250</b> rps</label><input type="range" id="rps" min="0" max="800" step="10" value="250"></div>
+      <div id="loadInfo" class="note"></div>
     </div>
 
     <div class="panel">
-      <h2>작업 <span class="badge sub">A3</span>
-        <label class="check" style="cursor:pointer;font-weight:400;font-size:10.5px"><input type="checkbox" id="mixOn"> 켜기</label></h2>
-      <div class="row">
-        <button data-mix="90:10:0">90/10</button>
-        <button data-mix="50:50:0">50/50</button>
-        <button data-mix="60:10:30">주문</button>
-      </div>
-      <details class="adv"><summary>유형별</summary><div id="mixRows"></div></details>
-      <div id="mixInfo" class="note"></div>
-    </div>
-
-    <div class="panel">
-      <h2>서버 설정</h2>
-      <div class="ctl"><label>스레드 <b id="threadsVal">50</b></label><input type="range" id="threads" min="1" max="200" step="1" value="50"></div>
-      <div class="ctl"><label>커넥션 <b id="connsVal">10</b></label><input type="range" id="conns" min="1" max="60" step="1" value="10"></div>
+      <h2>서버 설정 <small>모든 인스턴스 공통</small></h2>
+      <div class="ctl"><label>스레드 <b id="threadsVal">50</b></label><input type="range" id="threads" min="1" max="400" step="1" value="50"></div>
+      <div class="ctl"><label>DB 커넥션 <b id="connsVal">20</b></label><input type="range" id="conns" min="1" max="60" step="1" value="20"></div>
       <div class="ctl"><label>대기 큐 <b id="qcapVal">100</b></label><input type="range" id="qcap" min="10" max="1000" step="10" value="100"></div>
-      <div class="ctl" id="ctlDbt"><label>DB 시간 <b><span id="dbtVal">30</span> ms</b></label><input type="range" id="dbt" min="5" max="300" step="1" value="30"></div>
-      <details class="adv" id="advLoad">
-        <summary>고급</summary>
-        <div class="ctl"><label>경합 α <b><span id="alphaVal">0</span></b></label><input type="range" id="alpha" min="0" max="2" step="0.05" value="0"></div>
-        <div class="ctl"><label>무릎 γ <b><span id="gammaVal">2</span></b></label><input type="range" id="gamma" min="1" max="24" step="1" value="2"></div>
-        <div class="ctl"><label>타임아웃 <b><span id="toVal">3000</span> ms</b></label><input type="range" id="to" min="500" max="10000" step="500" value="3000"></div>
-        <div class="ctl"><label>재시도 <b><span id="retryVal">0</span> %</b></label><input type="range" id="retry" min="0" max="100" step="5" value="0"></div>
-        <label class="check" style="cursor:pointer"><input type="checkbox" id="cancel"> 취소 전파</label>
-      </details>
-      <div class="row">
-        <button data-preset="baseline">기본값</button>
-        <button data-preset="moreThreads">스레드↑</button>
-        <button data-preset="moreConns">커넥션↑</button>
-      </div>
+      <div class="ctl"><label>DB 시간 <b><span id="dbtVal">30</span> ms</b></label><input type="range" id="dbt" min="5" max="300" step="1" value="30"></div>
+      <div class="ctl"><label>요청당 CPU <b><span id="cpumsVal">8</span> ms</b></label><input type="range" id="cpums" min="0" max="60" step="1" value="8"></div>
+      <div class="ctl"><label>타임아웃 <b><span id="toVal">3000</span> ms</b></label><input type="range" id="to" min="500" max="10000" step="500" value="3000"></div>
+      <div class="row" style="margin-top:6px"><button id="cfgSave" title="지금 슬라이더 값 한 벌을 가운데 「설정 시나리오」에 저장">＋ 지금 설정을 시나리오로 저장</button></div>
     </div>
 
-    <div class="panel" id="candPanel">
-      <h2>후보 <span class="badge sub">A4</span></h2>
-      <div class="row">
-        <button class="primary" id="btnCandAdd">＋ 후보</button>
-        <button id="btnCandPreset">기본 3벌</button>
-      </div>
-      <div id="candList"></div>
-      <div class="row">
-        <button id="btnCandExport">저장</button>
-        <button id="btnCandImport">불러오기</button>
-        <button id="btnCandClear">곡선 해제</button>
-      </div>
-      <input type="file" id="candFile" accept=".json,application/json" style="display:none">
-      <div id="candMsg" class="note hint"></div>
+    <div class="panel">
+      <h2>비교할 인스턴스 <small>최대 4대</small></h2>
+      <div class="row"><select id="instPick"></select></div>
+      <div class="row"><button class="primary" id="instAdd">＋ 추가</button><button id="instPreset">기본 3종</button></div>
+      <div id="instList"></div>
     </div>
   </aside>
 
-  <!-- ─────────── B / C: 단면도 + 타임라인 ─────────── -->
-  <div class="panel canvas-wrap" id="stageWrap">
+  <!-- ─────────── 위: 선택한 인스턴스 한 대의 요청 흐름 (작게) ─────────── -->
+  <section class="canvas-wrap" id="stageWrap">
     <canvas id="stage"></canvas>
-  </div>
+  </section>
 
-
-  <div id="chartWrap">
-    <div id="tlWrap">
-      <canvas id="timeline"></canvas>
-      <div id="tooltip"></div>
-    </div>
-    <div id="vfWrap">
-      <div id="verifyBar">
-        <b style="color:var(--ink);font-size:11px">성능 곡선</b>
-        <label><button id="btnLoadCsv">실측 CSV</button><input type="file" id="csvFile" accept=".csv,text/csv"></label>
-        <button id="btnSweep">스윕</button>
-        <button id="btnExportSweep">내보내기</button>
-        <span id="verifyMsg"></span>
+  <!-- ─────────── 가운데: 리스트 (이 화면의 주인공) ─────────── -->
+  <section id="listWrap">
+    <!-- 왼쪽 반: 설정 후보를 저장해 두고 돌리기 전에 미리 본다 -->
+    <div class="listcol">
+      <div class="listhead">
+        <b>설정 시나리오</b>
+        <span id="cfgBasis"></span>
+        <div class="spacer"></div>
+        <button class="fbtn on" data-filter="all">전체</button>
+        <button class="fbtn" data-filter="ok">만족</button>
+        <button class="fbtn" data-filter="no">미달</button>
+        <div class="spacer"></div>
+        <input type="text" id="cfgName" placeholder="이름" maxlength="40" title="저장할 이름 (비우면 자동)">
+        <button class="primary" id="cfgSave2" title="지금 슬라이더 값 한 벌을 저장">＋ 저장</button>
+        <button id="cfgPreviewAll" title="모든 행을 헤드리스로 돌려 예측을 채운다">전부 미리보기</button>
       </div>
-      <canvas id="verify"></canvas>
-      <div id="tooltip2"></div>
+      <div class="listbody"><table class="stab" id="cfgTable"></table></div>
     </div>
-  </div>
+    <!-- 오른쪽 반: 같은 트래픽을 동시에 먹인 인스턴스들의 지금 상태 -->
+    <div class="listcol">
+      <div class="listhead">
+        <b>인스턴스 비교</b>
+        <span>최근 10초 평균 · 행을 누르면 위 흐름도가 그 인스턴스로 바뀐다</span>
+      </div>
+      <div class="listbody"><div id="instTable"></div></div>
+    </div>
+  </section>
 
-  <!-- ─────────── D: 분석 ─────────── -->
+  <!-- ─────────── 아래: 인스턴스 실시간 비교 ─────────── -->
+  <section class="canvas-wrap" id="cmpWrap">
+    <div class="canvas-title">인스턴스 실시간 비교</div>
+    <canvas id="cmp"></canvas>
+    <div id="cmpTip"></div>
+  </section>
+
+  <!-- ─────────── 결과 ─────────── -->
   <aside id="right">
     <div class="panel">
-      <h2>병목 판정 <span class="badge sub">D1</span></h2>
-      <div id="bottleneck" data-level="ok"><div><div class="t">정상</div></div></div>
-      <div class="tiles c4">
+      <h2>병목 <small id="bnWho"></small></h2>
+      <div id="bottleneck" data-level="ok"><div class="t">정상</div><div class="d"></div></div>
+      <div class="tiles">
         <div class="tile"><div class="k">처리량</div><div class="v"><span id="mThr">0</span><small>rps</small></div></div>
         <div class="tile"><div class="k">p95</div><div class="v"><span id="mP95">0</span><small>ms</small></div></div>
         <div class="tile"><div class="k">실패</div><div class="v"><span id="mErr">0</span><small>/s</small></div></div>
-        <div class="tile"><div class="k">이론 최대</div><div class="v"><span id="tCap">0</span><small>rps</small></div></div>
+        <div class="tile"><div class="k">이 인스턴스 최대</div><div class="v"><span id="tCap">0</span><small>rps</small></div></div>
       </div>
-      <div id="clsStats"></div>
     </div>
 
     <div class="panel">
-      <h2>최소 자원 <span class="badge sub">D4</span>
-        <span class="inl">비용비 <input type="number" id="sloCost" value="5" min="0.1" step="0.5"></span></h2>
-      <div class="row"><button class="primary" id="btnRecommend">탐색</button><button id="btnCapacity">트래픽별</button></div>
-      <progress id="recoProg" value="0" max="1" style="display:none"></progress>
-      <div id="recoOut" class="note res"></div>
+      <h2>추천 <small>목표를 만족하는 것 중 가장 싼 인스턴스</small></h2>
+      <div id="advice"></div>
     </div>
 
     <div class="panel">
-      <h2>실측 보정 <span class="badge sub">D7</span></h2>
-      <div class="slo-grid c4">
-        <div><label>보정</label><input type="text" id="fitLv" value="50,150,300"></div>
-        <div><label>검증</label><input type="text" id="hodLv" value="100,250,400"></div>
-        <div><label>서버 α</label><input type="number" id="calibAlpha" value="0.39" min="0" step="0.05"></div>
-        <div style="align-self:end"><label class="check" style="cursor:pointer;font-size:9.5px"><input type="checkbox" id="fitAlpha"> α추정</label></div>
+      <h2>모델 보정 <small id="calibState">보정 전</small></h2>
+      <div class="row">
+        <button class="primary" id="btnCalib">실측으로 보정 · 검증</button>
+        <button id="btnCsv" title="직접 측정한 CSV 로 보정">CSV</button>
+        <button id="btnReport" title="현재 비교 결과를 마크다운으로 저장">리포트</button>
       </div>
-      <div class="row"><button id="btnLoadCsv2">실측 CSV</button><button id="btnAutoSplit">자동</button><button class="primary" id="btnCalib">보정·검증</button></div>
-      <progress id="calibProg" value="0" max="1" style="display:none"></progress>
-      <div id="calibOut" class="note res"></div>
-    </div>
-
-    <div class="panel">
-      <h2>인프라 추천 <span class="badge sub">D5</span> <span class="badge sub">D8</span></h2>
-      <div class="slo-grid c4">
-        <div><label>앱 CPU</label><input type="number" id="infCpu" value="5" min="0" step="1"></div>
-        <div><label>쿼리 CPU</label><input type="number" id="infDbCpu" value="0.3" min="0" max="1" step="0.1"></div>
-        <div><label>이용률</label><input type="number" id="infUtil" value="70" min="20" max="95" step="5"></div>
-        <div><label>메모리</label><input type="number" id="infMemT" value="2" min="0.5" step="0.5"></div>
-      </div>
-      <div class="row"><button class="primary" id="btnInfra">EC2 / RDS</button>
-        <button id="btnReport">MD</button><button id="btnReportJson">JSON</button></div>
-      <div id="infraOut" class="note res"></div>
-      <div id="reportOut" class="note res"></div>
+      <input type="file" id="csvFile" accept=".csv,text/csv" style="display:none">
+      <div id="calibOut" class="note">실측 CSV의 일부 rps로만 모델을 맞추고, 맞추지 않은 rps에서 예측이 맞는지 확인한다.</div>
     </div>
   </aside>
 </main>
 
-<!-- 시뮬레이션 재생 컨트롤 + 시나리오 진행 위치 -->
-<div id="playbar">
-  <button id="btnPause">일시정지</button>
-  <button id="btnReset">처음으로</button>
-  <span>시뮬 <b id="simClock">0.0s</b></span>
-  <span id="scName">수동</span>
-  <div id="scTrack"><div id="scFill"></div><div id="scMarks"></div></div>
-  <span id="scPos">–</span>
-  <select id="win"><option value="60">60초</option><option value="120">120초</option><option value="300">300초</option></select>
-</div>
-
-<script src="engine.js"></script>   <!-- 파트 1 · 진단: 모델·시뮬·병목·렌더링 -->
-<script src="advisor.js"></script>  <!-- 파트 2 · 판단: 비교·추천·보정·리포트 -->
-<script src="app.js"></script>      <!-- 공동: UI 바인딩·메인 루프·데이터 로딩 -->
+<script src="engine.js"></script>   <!-- 파트 1 · 모델·시뮬·병목 판정·그림 -->
+<script src="advisor.js"></script>  <!-- 파트 2 · 인스턴스 카탈로그·실시간 비교·실측 보정 -->
+<script src="app.js"></script>      <!-- 공동 · UI 바인딩·메인 루프·데이터 로딩 -->
 </body>
 </html>
