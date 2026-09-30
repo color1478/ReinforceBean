@@ -69,6 +69,7 @@ function createSim(M, opts = {}) {
   const S = {
     M, t: 0, reqs: [], fx: [], retryQ: [], nextId: 1, usedThreads: 0, usedConns: 0, lastSec: 0, history: [],
     win: null, onSecond: opts.onSecond || null,
+    trace: null,   // 파일 trace 재생 상태 (startTrace). 켜져 있으면 포아송 도착 대신 이벤트 시각에 요청을 넣는다
   };
   const nCls = (M.mix && M.mix.length) || 0;
   const newWin = () => ({ done: 0, rej: 0, to: 0, retry: 0, wasted: 0, dbSum: 0, dbN: 0, lat: [],
@@ -91,8 +92,10 @@ function createSim(M, opts = {}) {
   // 부하 의존: 커넥션이 동시에 붐빌수록 쿼리 한 건이 느려진다 (usedConns는 이 시점에 방금 +1 된 상태)
   const dbEff = (r) => dbBase(r) * (1 + (M.dbLoadAlpha || 0) * Math.pow(S.usedConns / M.conns, M.dbLoadGamma == null ? 2 : M.dbLoadGamma));
 
-  function spawn(retry) {
-    return { id: S.nextId++, state: 'queued', tSpawn: S.t, tState: S.t, tDone: 0, retry: !!retry, abandoned: false, cls: pickClass(),
+  // cls·tAt 을 주지 않으면 지금 시각에 비율대로 유형을 뽑는다. trace 는 이벤트의 op·정확한 도착 시각을 넘긴다
+  function spawn(retry, cls, tAt) {
+    const t0 = tAt == null ? S.t : tAt;
+    return { id: S.nextId++, state: 'queued', tSpawn: t0, tState: t0, tDone: 0, retry: !!retry, abandoned: false, cls: cls === undefined ? pickClass() : cls,
              tq: 0, twc: 0, tdb: 0, x: -20, y: 0, tx: 0, ty: 0, thrSlot: null, dbSlot: null };
   }
   function finish(r, state) {
@@ -114,12 +117,31 @@ function createSim(M, opts = {}) {
     if (queued >= M.queueCap) { finish(r, 'rejected'); return false; }
     S.reqs.push(r); return true;
   }
+  // trace 재생: 도착 시각(origin + 주기 오프셋 + t_ms)이 지금 이하인 이벤트를 전부 꺼내 그 시각 그대로 요청을 만든다
+  function injectTrace(queued) {
+    const tr = S.trace;
+    const cls = M.mixOn && M.mix ? TRACE_OP_MIX.map(id => M.mix.findIndex(m => m.id === id)) : null;
+    while (!tr.done) {
+      if (tr.i >= tr.n) { if (!tr.loop) { tr.done = true; break; } tr.i = 0; tr.base += tr.dur; tr.cycle++; continue; }
+      const tAt = tr.base + tr.t[tr.i];
+      if (tAt > S.t) break;
+      const c = cls ? cls[tr.op[tr.i]] : -1;
+      tr.i++; tr.injected++; tr.lastT = tAt; tr.rec.push(tAt);
+      if (tr.log) tr.log.push(tAt);
+      if (enqueue(spawn(false, c, tAt), queued)) queued++;
+    }
+    const lo = S.t - 1000;
+    while (tr.recHead < tr.rec.length && tr.rec[tr.recHead] <= lo) tr.recHead++;
+    if (tr.recHead > 4096) { tr.rec = tr.rec.slice(tr.recHead); tr.recHead = 0; }
+    return queued;
+  }
   function step(dt) {
     S.t += dt;
     let queued = 0; for (const r of S.reqs) if (r.state === 'queued') queued++;
-    // (a) 유입: 신규(포아송) + 재시도(예약)
-    const n = poisson(M.rps * dt / 1000);
+    // (a) 유입: 신규(포아송 — trace 재생 중이면 0건) + trace 이벤트 + 재시도(예약)
+    const n = S.trace ? 0 : poisson(M.rps * dt / 1000);
     for (let i = 0; i < n; i++) if (enqueue(spawn(false), queued)) queued++;
+    if (S.trace) queued = injectTrace(queued);
     while (S.retryQ.length && S.retryQ[0] <= S.t) { S.retryQ.shift(); S.win.retry++; if (enqueue(spawn(true), queued)) queued++; }
     // (b) 상태 전이 (FIFO)
     const alive = [];
@@ -159,7 +181,7 @@ function createSim(M, opts = {}) {
     S.win = newWin();
     if (S.onSecond) S.onSecond(h);
   }
-  function reset() { S.t = 0; S.reqs = []; S.fx = []; S.retryQ = []; S.usedThreads = 0; S.usedConns = 0; S.history = []; S.lastSec = 0; S.win = newWin(); }
+  function reset() { S.t = 0; S.reqs = []; S.fx = []; S.retryQ = []; S.usedThreads = 0; S.usedConns = 0; S.history = []; S.lastSec = 0; S.win = newWin(); S.trace = null; }
   return { S, step, reset };
 }
 
@@ -279,7 +301,474 @@ function applyScenario(sim) {
   Object.assign(MODEL, BASE);
   const cur = sc.at(tt);
   for (const k in cur) if (cur[k] != null) MODEL[k] = cur[k];
+  // 파일 trace: 시나리오가 바뀌거나 scenarioStart 가 바뀌면(재시작) 포인터를 처음으로 되돌린다.
+  // MODEL.rps 는 슬라이더 값 대신 최근 1초 실제 도착 수 — 이론값·병목 판정·표시가 실제 유입을 보게 한다
+  if (sc.trace) {
+    const tr = sim.S.trace;
+    if (!tr || tr.data !== sc.trace || tr.origin !== scenarioStart) sim.S.trace = startTrace(sc.trace, scenarioStart);
+    MODEL.rps = traceRecent(sim.S.trace, sim.S.t);
+  } else if (sim.S.trace) sim.S.trace = null;
   return tt;
+}
+
+/* =====================================================================
+ * 4b. 파일 시나리오 — docs/scenario-format.md (v1)
+ *   curve: 키프레임 RPS 곡선 → 기존 at(t) 경로 (포아송 도착)
+ *   trace: 요청별 도착 시각 → createSim 의 S.trace 로 적힌 시각에 정확히 주입
+ *   배율은 불러올 때 적용하는 옵션이다. 파일에는 원본 규모만 둔다.
+ *   이 구획의 함수는 DOM 에 접근하지 않는다.
+ * ===================================================================== */
+const SCN_FORMAT = 'reinforcebean-scenario';
+const TRACE_OPS = ['read', 'search', 'write'];            // op 코드 0·1·2
+const TRACE_OP_MIX = ['browse', 'search', 'write'];       // 같은 순서의 MODEL.mix id (조회·검색·쓰기)
+const TRACE_EXCLUDE_DEFAULT = ['cron', 'admin', 'infra'];
+const TRACE_MAX_EVENTS = 5000000;                         // 배율 결과 상한 — 넘으면 브라우저 메모리·정렬 시간이 감당이 안 된다
+// 이 키들은 슬라이더·체크박스가 있어 params 를 UI에 한 번 반영한다. 나머지 params 는 그 시나리오가 켜져 있는 동안만 at() 이 덮어쓴다
+const SCN_UI_PARAMS = ['rps', 'threads', 'conns', 'queueCap', 'dbTimeMs', 'timeoutMs', 'retryProb', 'dbLoadAlpha', 'dbLoadGamma', 'cancelOnTimeout', 'mixOn'];
+
+const scnIsObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+// explain.text 는 innerHTML 로 그려지므로 <b> 만 살리고 나머지는 글자로 만든다
+const scnSanitize = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/&lt;(\/?)b&gt;/g, '<$1b>');
+
+// 텍스트 → { ok: true, scenario, warnings } | { ok: false, errors }
+function parseScenarioFile(text) {
+  const errors = [], warnings = [], MAXE = 30; let more = 0;
+  const err = (m) => { if (errors.length < MAXE) errors.push(m); else more++; };
+  const fail = () => ({ ok: false, errors: more ? errors.concat(`… 외 ${more}건의 오류`) : errors });
+  if (typeof text !== 'string' || !text.trim()) return { ok: false, errors: ['빈 파일입니다.'] };
+  let d;
+  try { d = JSON.parse(text); } catch (e) { return { ok: false, errors: [`JSON 파싱 실패: ${e.message}`] }; }
+  if (!scnIsObj(d)) return { ok: false, errors: ['최상위는 객체({ … })여야 합니다.'] };
+  const isInt = Number.isInteger;
+  const unitless = (o, where) => {
+    for (const k of ['t', 'time', 't_s', 't_sec']) if (k in o && !('t_ms' in o)) {
+      err(`${where}: 단위 없는 시간 필드 \`${k}\`가 있습니다. \`t_ms\`(밀리초)를 사용하세요.`); return true;
+    }
+    return false;
+  };
+  const modelKeyErr = (k, where, numericOnly) => {
+    if (!Object.prototype.hasOwnProperty.call(MODEL, k)) return `${where}: "${k}"는 MODEL에 없는 키입니다.`;
+    const tp = typeof MODEL[k];
+    if (tp !== 'number' && !(tp === 'boolean' && !numericOnly)) return `${where}: "${k}"는 ${numericOnly ? '숫자 트랙으로' : '값으로'} 지정할 수 없는 키입니다.`;
+    return null;
+  };
+
+  // ── 공통 필드 ──
+  if (d.format !== SCN_FORMAT) err(`format은 "${SCN_FORMAT}"이어야 합니다${d.format === undefined ? ' (누락)' : ` (현재 ${JSON.stringify(d.format)})`}.`);
+  if (d.version === undefined) err('version이 없습니다.');
+  else if (d.version !== 1) err(`version ${JSON.stringify(d.version)}은 지원하지 않습니다. 1만 지원합니다.`);
+  if (d.mode !== 'curve' && d.mode !== 'trace') err(`mode는 "curve" 또는 "trace"여야 합니다${d.mode === undefined ? ' (누락)' : ` (현재 ${JSON.stringify(d.mode)})`}.`);
+  if (typeof d.name !== 'string' || !d.name.trim()) err('name(문자열)이 없습니다.');
+  if (d.duration_ms === undefined) {
+    const alt = ['duration', 'duration_s', 'duration_sec'].find(k => k in d);
+    err(alt ? `단위 없는 시간 필드 \`${alt}\`가 있습니다. \`duration_ms\`(밀리초)를 사용하세요.` : 'duration_ms가 없습니다.');
+  } else if (!isInt(d.duration_ms) || d.duration_ms <= 0) err('duration_ms는 0보다 큰 정수(밀리초)여야 합니다.');
+  if (d.loop !== undefined && typeof d.loop !== 'boolean') err('loop는 true 또는 false여야 합니다.');
+  if (d.description !== undefined && typeof d.description !== 'string') err('description은 문자열이어야 합니다.');
+  if (d.source !== undefined && !scnIsObj(d.source)) err('source는 객체여야 합니다.');
+  const dur = d.duration_ms, durOk = isInt(dur) && dur > 0;
+
+  const params = {};
+  if (d.params !== undefined) {
+    if (!scnIsObj(d.params)) err('params는 객체여야 합니다.');
+    else for (const k in d.params) {
+      const ke = modelKeyErr(k, 'params', false); if (ke) { err(ke); continue; }
+      const v = d.params[k], num = typeof MODEL[k] === 'number';
+      if (num ? !(typeof v === 'number' && isFinite(v)) : typeof v !== 'boolean') err(`params.${k}: ${num ? '숫자' : 'true/false'}여야 합니다.`);
+      else params[k] = v;
+    }
+  }
+
+  const explain = [];
+  if (d.explain !== undefined) {
+    if (!Array.isArray(d.explain)) err('explain은 배열이어야 합니다.');
+    else d.explain.forEach((e, i) => {
+      const w = `explain[${i}]`;
+      if (!scnIsObj(e)) return err(`${w}: 객체여야 합니다.`);
+      if (unitless(e, w)) return;
+      if (!isInt(e.t_ms) || e.t_ms < 0) return err(`${w}: t_ms는 0 이상의 정수(밀리초)여야 합니다.`);
+      if (typeof e.text !== 'string') return err(`${w}: text(문자열)가 없습니다.`);
+      explain.push({ t_ms: e.t_ms, text: scnSanitize(e.text) });
+    });
+  }
+
+  // ── curve ──
+  let tracks = null, events = null;
+  if (d.mode === 'curve') {
+    if (!scnIsObj(d.tracks)) err('curve 모드에는 tracks 객체가 필요합니다.');
+    else {
+      if (!('rps' in d.tracks)) err('tracks.rps가 없습니다 (curve 모드 필수).');
+      tracks = {};
+      for (const k in d.tracks) {
+        const w = `tracks.${k}`;
+        const ke = modelKeyErr(k, 'tracks', true); if (ke) { err(ke); continue; }
+        const pts = d.tracks[k];
+        if (!Array.isArray(pts) || !pts.length) { err(`${w}: 점 배열이 비어 있거나 배열이 아닙니다.`); continue; }
+        let bad = false; const out = [];
+        pts.forEach((p, i) => {
+          const wp = `${w}[${i}]`;
+          if (!scnIsObj(p)) { err(`${wp}: 객체여야 합니다.`); bad = true; return; }
+          if (unitless(p, wp)) { bad = true; return; }
+          if (!isInt(p.t_ms) || p.t_ms < 0) { err(`${wp}: t_ms는 0 이상의 정수(밀리초)여야 합니다.`); bad = true; return; }
+          if (typeof p.v !== 'number' || !isFinite(p.v) || p.v < 0) { err(`${wp}: v는 0 이상의 유한한 숫자여야 합니다.`); bad = true; return; }
+          out.push({ t_ms: p.t_ms, v: p.v });
+        });
+        if (bad) continue;
+        for (let i = 1; i < out.length && !bad; i++) {
+          if (out[i].t_ms < out[i - 1].t_ms) { err(`${w}[${i}]: t_ms ${out[i].t_ms}가 앞 점(${out[i - 1].t_ms})보다 작습니다. 오름차순이어야 합니다 (역순 불가).`); bad = true; }
+          else if (i >= 2 && out[i].t_ms === out[i - 1].t_ms && out[i].t_ms === out[i - 2].t_ms) { err(`${w}: t_ms ${out[i].t_ms}가 3개 이상입니다. 같은 시각은 최대 2개(순간 점프)까지만 허용됩니다.`); bad = true; }
+        }
+        if (!bad && durOk && out[out.length - 1].t_ms > dur) { err(`${w}: 마지막 t_ms ${out[out.length - 1].t_ms}가 duration_ms(${dur})보다 큽니다.`); bad = true; }
+        if (!bad) tracks[k] = out;
+      }
+    }
+  }
+
+  // ── trace ──
+  else if (d.mode === 'trace') {
+    if (!Array.isArray(d.events)) err('trace 모드에는 events 배열이 필요합니다.');
+    else if (!d.events.length) err('events가 비어 있습니다.');
+    else {
+      const E = d.events; let sorted = true, prev = -Infinity;
+      for (let i = 0; i < E.length; i++) {
+        const e = E[i], w = `events[${i}]`;
+        if (!scnIsObj(e)) { err(`${w}: 객체여야 합니다.`); continue; }
+        if (unitless(e, w)) continue;
+        if (!isInt(e.t_ms) || e.t_ms < 0 || (durOk && e.t_ms >= dur)) { err(`${w}: t_ms ${JSON.stringify(e.t_ms)}는 0 이상, duration_ms(${dur}) 미만의 정수(밀리초)여야 합니다.`); continue; }
+        if (!TRACE_OPS.includes(e.op)) { err(`${w}: op ${JSON.stringify(e.op)}는 허용되지 않습니다. "read", "search", "write" 중 하나여야 합니다.`); continue; }
+        if (e.g != null && !isInt(e.g)) err(`${w}: g(묶음 번호)는 정수여야 합니다.`);
+        if (e.src !== undefined && typeof e.src !== 'string') err(`${w}: src는 문자열이어야 합니다.`);
+        if (e.ep !== undefined && typeof e.ep !== 'string') err(`${w}: ep는 문자열이어야 합니다.`);
+        if (e.t_ms < prev) sorted = false;
+        prev = e.t_ms;
+      }
+      if (!errors.length) {
+        events = traceColumns(E, sorted);
+        if (!sorted) warnings.push('events가 t_ms 순으로 정렬되어 있지 않아 불러오면서 정렬했습니다.');
+      }
+    }
+  }
+  if (errors.length) return fail();
+  return { ok: true, warnings, scenario: {
+    format: SCN_FORMAT, version: 1, mode: d.mode, name: d.name.trim(), description: d.description || '',
+    duration_ms: dur, loop: !!d.loop, source: d.source || {}, params, explain, tracks, events } };
+}
+
+// 이벤트 객체 배열 → 타입 배열 열 (수십만 건 대비). sorted=false 면 t_ms 기준 안정 정렬
+function traceColumns(E, sorted) {
+  const n = E.length, order = new Uint32Array(n);
+  for (let i = 0; i < n; i++) order[i] = i;
+  if (!sorted) order.sort((a, b) => E[a].t_ms - E[b].t_ms || a - b);
+  const t = new Float64Array(n), op = new Uint8Array(n), g = new Float64Array(n), src = new Uint16Array(n), ep = new Uint32Array(n);
+  const srcNames = [], epNames = [], srcIdx = new Map(), epIdx = new Map(), opCount = [0, 0, 0], gs = new Set();
+  const intern = (m, names, s) => { let k = m.get(s); if (k === undefined) { k = names.length; m.set(s, k); names.push(s); } return k; };
+  for (let j = 0; j < n; j++) {
+    const e = E[order[j]];
+    t[j] = e.t_ms; op[j] = TRACE_OPS.indexOf(e.op); opCount[op[j]]++;
+    if (e.g == null) g[j] = NaN; else { g[j] = e.g; gs.add(e.g); }
+    src[j] = intern(srcIdx, srcNames, e.src || 'user');
+    ep[j] = intern(epIdx, epNames, e.ep || '');
+  }
+  return { n, t, op, g, src, srcNames, ep, epNames, opCount, groupCount: gs.size };
+}
+
+// 명세 2장 보간. x(ms) 에서의 트랙 값. loop=false 이고 x >= duration 이면 rps 는 0, 다른 트랙은 undefined(MODEL 기본값 유지)
+function curveValue(p, x, dur, loop, isRps) {
+  if (loop) x = ((x % dur) + dur) % dur;
+  else if (x >= dur) return isRps ? 0 : undefined;
+  const n = p.length;
+  if (x < p[0].t_ms) return p[0].v;
+  if (x >= p[n - 1].t_ms) return p[n - 1].v;
+  // p[i].t_ms <= x 인 마지막 i. 같은 t_ms 가 두 개면 뒤쪽 점이 잡히므로 그 시각에서는 뒤쪽 값이 된다
+  let lo = 0, hi = n - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (p[mid].t_ms <= x) lo = mid; else hi = mid - 1; }
+  const a = p[lo], b = p[lo + 1];
+  return a.v + (b.v - a.v) * (x - a.t_ms) / (b.t_ms - a.t_ms);
+}
+const scaleCurvePoints = (p, N) => p.map(q => ({ t_ms: q.t_ms, v: q.v * N }));
+// 곡선의 평균 rps(정확한 면적 ÷ 길이)와 최댓값
+function curveStats(p, dur) {
+  const n = p.length; let area = p[0].v * Math.min(p[0].t_ms, dur), peak = 0;
+  for (let i = 0; i < n; i++) {
+    peak = Math.max(peak, p[i].v);
+    if (i < n - 1) area += (p[i].v + p[i + 1].v) / 2 * (p[i + 1].t_ms - p[i].t_ms);
+  }
+  area += p[n - 1].v * Math.max(0, dur - p[n - 1].t_ms);
+  return { meanRps: area / dur, peakRps: peak };
+}
+// 정렬된 도착 시각 배열의 총 건수 · 평균 rps · 1초 창 최대 건수
+function traceStats(t, n, dur) {
+  let peak = 0;
+  for (let i = 0, j = 0; i < n; i++) { while (t[i] - t[j] >= 1000) j++; if (i - j + 1 > peak) peak = i - j + 1; }
+  return { n, meanRps: n / (dur / 1000), peak1s: peak };
+}
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// 명세 4장 trace 배율. ev = traceColumns 결과. o = { N, jitter_ms, seed, exclude_src, duration_ms }
+function scaleTrace(ev, o) {
+  const N = o.N, J = o.jitter_ms || 0, d = o.duration_ms;
+  if (!(typeof N === 'number' && isFinite(N) && N > 0)) return { ok: false, errors: ['배율 N은 0보다 큰 숫자여야 합니다.'] };
+  if (!(isFinite(J) && J >= 0)) return { ok: false, errors: ['jitter_ms는 0 이상이어야 합니다.'] };
+  const n = ev.n, excl = new Set(o.exclude_src || []);
+  const isEx = ev.srcNames.map(s => excl.has(s));
+  // 1~2. 제외 출처는 그대로 한 번. 나머지는 g 로 묶는다(없으면 이벤트 하나가 한 묶음). 묶음은 처음 등장한 순서
+  const gid = new Int32Array(n).fill(-1), groups = [], gmap = new Map();
+  let nEx = 0, maxG = 0;
+  for (let i = 0; i < n; i++) {
+    if (!isNaN(ev.g[i])) maxG = Math.max(maxG, ev.g[i]);
+    if (isEx[ev.src[i]]) { nEx++; continue; }
+    let q;
+    if (!isNaN(ev.g[i])) { q = gmap.get(ev.g[i]); if (q === undefined) { q = groups.length; gmap.set(ev.g[i], q); groups.push([]); } }
+    else { q = groups.length; groups.push([]); }
+    groups[q].push(i); gid[i] = q;
+  }
+  const est = nEx + (n - nEx) * Math.ceil(N);
+  if (est > TRACE_MAX_EVENTS) return { ok: false, errors: [`배율 결과가 약 ${est.toLocaleString()}건으로 너무 많습니다 (최대 ${TRACE_MAX_EVENTS.toLocaleString()}건). 배율을 낮추세요.`] };
+  // 3~6. 묶음마다 복제 수와 복제본별 shift 를 시드 난수로 정한다 (묶음 순서대로 c → shift… 순으로 뽑는다)
+  const rng = mulberry32(o.seed | 0), fl = Math.floor(N), frac = N - fl;
+  const copies = new Uint32Array(groups.length), shifts = new Array(groups.length);
+  let total = nEx;
+  for (let q = 0; q < groups.length; q++) {
+    const c = fl + (rng() < frac ? 1 : 0), sh = [];
+    for (let k = 1; k < c; k++) sh.push(Math.round((rng() * 2 - 1) * J));
+    copies[q] = c; shifts[q] = sh; total += c * groups[q].length;
+  }
+  // 원본 자리(k=0)는 원래 순서 그대로 앞에, 복제본은 뒤에 쌓은 뒤 안정 정렬 → N=1 이면 원본과 완전히 같다
+  const t = new Float64Array(total), op = new Uint8Array(total), g = new Float64Array(total), src = new Uint16Array(total);
+  let w = 0;
+  for (let i = 0; i < n; i++) {
+    if (!isEx[ev.src[i]] && copies[gid[i]] === 0) continue;
+    t[w] = ev.t[i]; op[w] = ev.op[i]; g[w] = ev.g[i]; src[w] = ev.src[i]; w++;
+  }
+  let nextG = maxG + 1, bundles = 0;
+  for (let q = 0; q < groups.length; q++) {
+    bundles += copies[q];
+    for (const s of shifts[q]) {
+      const ng = nextG++;
+      for (const i of groups[q]) {
+        let x = ev.t[i] + s;
+        if (x < 0 || x >= d) x = ((x % d) + d) % d;   // 7. 범위를 벗어나면 감는다
+        t[w] = x; op[w] = ev.op[i]; g[w] = ng; src[w] = ev.src[i]; w++;
+      }
+    }
+  }
+  // 9. t_ms 기준 안정 정렬 (동률은 쌓은 순서)
+  const ord = new Uint32Array(total);
+  for (let i = 0; i < total; i++) ord[i] = i;
+  ord.sort((a, b) => t[a] - t[b] || a - b);
+  const T = new Float64Array(total), OP = new Uint8Array(total), G = new Float64Array(total), SRC = new Uint16Array(total);
+  for (let i = 0; i < total; i++) { const k = ord[i]; T[i] = t[k]; OP[i] = op[k]; G[i] = g[k]; SRC[i] = src[k]; }
+  return { ok: true, n: total, t: T, op: OP, g: G, src: SRC, srcNames: ev.srcNames, bundles, excluded: nEx };
+}
+
+// 파싱된 시나리오를 배율 옵션과 함께 SCENARIOS['file:이름'] 에 등록 (같은 이름이면 덮어쓴다)
+//   → { ok: true, key, entry, before, after } | { ok: false, errors }
+function registerFileScenario(sc, opts) {
+  const o = Object.assign({ N: 1, jitter_ms: 30000, seed: 1, exclude_src: TRACE_EXCLUDE_DEFAULT }, opts);
+  const key = 'file:' + sc.name, dur = sc.duration_ms;
+  const ui = {}, fixed = {};
+  for (const k in sc.params) (SCN_UI_PARAMS.includes(k) ? ui : fixed)[k] = sc.params[k];
+  const explain = sc.explain.map(e => ({ t: e.t_ms / 1000, text: e.text })).sort((a, b) => a.t - b.t);
+  if (!explain.length) explain.push({ t: 0, text: scnSanitize(sc.description || sc.name) });
+  const entry = { name: '파일: ' + sc.name, file: sc, mode: sc.mode, spanSec: dur / 1000, params: ui, explain };
+  if (sc.loop) entry.period = dur / 1000;
+  let before, after;
+  if (sc.mode === 'curve') {
+    const tracks = Object.assign({}, sc.tracks, { rps: scaleCurvePoints(sc.tracks.rps, o.N) });
+    entry.at = (t) => {
+      const out = Object.assign({}, fixed), x = t * 1000;
+      for (const k in tracks) { const v = curveValue(tracks[k], x, dur, sc.loop, k === 'rps'); if (v !== undefined) out[k] = v; }
+      return out;
+    };
+    const s = curveStats(sc.tracks.rps, dur);
+    before = { meanRps: s.meanRps, peak: s.peakRps };
+    after = { meanRps: s.meanRps * o.N, peak: s.peakRps * o.N };
+  } else {
+    const r = scaleTrace(sc.events, { N: o.N, jitter_ms: o.jitter_ms, seed: o.seed, exclude_src: o.exclude_src, duration_ms: dur });
+    if (!r.ok) return r;
+    entry.trace = { t: r.t, op: r.op, n: r.n, dur, loop: sc.loop };
+    entry.at = () => Object.assign({}, fixed);   // rps 는 반환하지 않는다 — 도착은 applyScenario 가 켜는 trace 재생이 만든다
+    const b = traceStats(sc.events.t, sc.events.n, dur), a = traceStats(r.t, r.n, dur);
+    // 배율 대상 묶음 수 (g 가 없는 이벤트는 하나가 한 묶음)
+    const ev = sc.events, ex = new Set(o.exclude_src || []), seen = new Set();
+    let singles = 0;
+    for (let i = 0; i < ev.n; i++) {
+      if (ex.has(ev.srcNames[ev.src[i]])) continue;
+      if (isNaN(ev.g[i])) singles++; else seen.add(ev.g[i]);
+    }
+    before = { n: b.n, meanRps: b.meanRps, peak: b.peak1s, bundles: singles + seen.size };
+    after = { n: a.n, meanRps: a.meanRps, peak: a.peak1s, bundles: r.bundles };
+  }
+  SCENARIOS[key] = entry;
+  return { ok: true, key, entry, before, after };
+}
+
+// trace 재생 상태. origin = 재생을 시작한 엔진 시각(ms). 이벤트 도착 시각 = origin + 주기×길이 + t_ms
+function startTrace(data, origin) {
+  return { data, t: data.t, op: data.op, n: data.n, dur: data.dur, loop: data.loop, origin, base: origin,
+           i: 0, cycle: 0, done: false, injected: 0, lastT: NaN, rec: [], recHead: 0, log: null };
+}
+// 최근 1초 동안 실제로 들어온 trace 요청 수
+function traceRecent(tr, now) {
+  if (!tr) return 0;
+  let h = tr.recHead; const lo = now - 1000;
+  while (h < tr.rec.length && tr.rec[h] <= lo) h++;
+  return tr.rec.length - h;
+}
+
+// 헤드리스로 trace 를 재생해 엔진 주입 경로를 검사한다 (셀프 테스트용)
+function replayTraceHeadless(trace, sec, opts) {
+  const M = Object.assign({}, MODEL, { dt: 4, retryProb: 0 }, opts || {});
+  const sim = createSim(M);
+  sim.S.trace = startTrace(trace, 0); sim.S.trace.log = [];
+  const steps = Math.round(sec * 1000 / M.dt);
+  for (let i = 0; i < steps; i++) sim.step(M.dt);
+  return { tr: sim.S.trace, history: sim.S.history, sim };
+}
+
+// 브라우저 콘솔에서 runScenarioSelfTest() — 명세 6장 기대 결과를 전부 검사한다
+function runScenarioSelfTest() {
+  const rows = [];
+  const add = (구분, 항목, pass, 상세) => rows.push({ 구분, 항목, 결과: pass === null ? '건너뜀' : pass ? '통과' : '실패', 상세: 상세 == null ? '' : String(상세) });
+  const r2 = (v) => Math.round(v * 100) / 100;
+  const base = { format: SCN_FORMAT, version: 1 };
+
+  // ── curve: spike_then_surge_3min.json 과 같은 키프레임 ──
+  const CURVE = Object.assign({}, base, { mode: 'curve', name: '__selftest_curve', duration_ms: 180000, loop: false,
+    tracks: { rps: [[0, 0], [40000, 100], [60000, 100], [60000, 400], [70000, 400], [70000, 100], [120000, 100], [130000, 600], [180000, 100]].map(([t_ms, v]) => ({ t_ms, v })) } });
+  const pc = parseScenarioFile(JSON.stringify(CURVE));
+  add('curve', '예제 파싱', pc.ok, pc.ok ? '' : pc.errors.join(' / '));
+  if (pc.ok) {
+    const EXP = [[20000, 50], [59999, 100], [60000, 400], [69999, 400], [70000, 100], [125000, 350], [130000, 600], [155000, 350], [180000, 0]];
+    for (const N of [1, 2]) {
+      const reg = registerFileScenario(pc.scenario, { N }), sc = SCENARIOS[reg.key];
+      const pts = scaleCurvePoints(pc.scenario.tracks.rps, N);
+      for (const [x, v] of EXP) {
+        const viaAt = sc.at(x / 1000).rps, direct = curveValue(pts, x, 180000, false, true);
+        add('curve', `x=${x}ms · 배율 ${N}`, r2(viaAt) === r2(v * N) && r2(direct) === r2(v * N), `기대 ${v * N} · 보간 ${r2(direct)} · at(t) ${r2(viaAt)}`);
+      }
+      delete SCENARIOS[reg.key];
+    }
+  }
+
+  // ── trace: test_trace_small.json ──
+  const SMALL = Object.assign({}, base, { mode: 'trace', name: '__selftest_trace', duration_ms: 10000, loop: false, events: [
+    { t_ms: 1000, op: 'read', ep: 'GET products', g: 1, src: 'user' },
+    { t_ms: 1005, op: 'read', ep: 'GET banners', g: 1, src: 'user' },
+    { t_ms: 1010, op: 'read', ep: 'GET notices', g: 1, src: 'user' },
+    { t_ms: 5000, op: 'write', ep: 'POST orders', g: 2, src: 'user' },
+    { t_ms: 5020, op: 'read', ep: 'GET orders', g: 2, src: 'user' },
+    { t_ms: 7000, op: 'write', ep: 'PATCH matches', src: 'cron' }] });
+  const pt = parseScenarioFile(JSON.stringify(SMALL));
+  add('trace', '예제 파싱 (6건)', pt.ok && pt.scenario.events.n === 6, pt.ok ? `${pt.scenario.events.n}건` : pt.errors.join(' / '));
+  if (pt.ok) {
+    const ev = pt.scenario.events;
+    const run = (N, J, seed) => scaleTrace(ev, { N, jitter_ms: J, seed, exclude_src: TRACE_EXCLUDE_DEFAULT, duration_ms: 10000 });
+    const dump = (r) => JSON.stringify(Array.from({ length: r.n }, (_, i) => [r.t[i], r.op[i], r.srcNames[r.src[i]], isNaN(r.g[i]) ? null : r.g[i]]));
+    const countAt = (r) => { const m = {}; for (let i = 0; i < r.n; i++) m[r.t[i]] = (m[r.t[i]] || 0) + 1; return m; };
+    const sortedOk = (r) => { for (let i = 1; i < r.n; i++) if (r.t[i] < r.t[i - 1]) return false; return true; };
+
+    const a1 = run(1, 30000, 1);
+    add('trace 배율', '배율 1 = 원본과 완전히 같음', dump(a1) === dump(ev), `${a1.n}건`);
+
+    const a3 = run(3, 0, 1), c3 = countAt(a3), exp3 = { 1000: 3, 1005: 3, 1010: 3, 5000: 3, 5020: 3, 7000: 1 };
+    add('trace 배율', '배율 3 · jitter 0 → 16건', a3.n === 16, `${a3.n}건`);
+    add('trace 배율', '배율 3 · jitter 0 → t_ms별 개수', JSON.stringify(c3) === JSON.stringify(exp3), JSON.stringify(c3));
+
+    const b = run(3, 2000, 1), b2 = run(3, 2000, 1);
+    add('trace 배율', '배율 3 · jitter 2000 → 16건', b.n === 16, `${b.n}건`);
+    const cron = []; for (let i = 0; i < b.n; i++) if (b.srcNames[b.src[i]] === 'cron') cron.push(b.t[i]);
+    add('trace 배율', '크론은 정확히 1건, 시각 7000 그대로', cron.length === 1 && cron[0] === 7000, JSON.stringify(cron));
+    const byG = new Map(); for (let i = 0; i < b.n; i++) if (b.srcNames[b.src[i]] === 'user') { const k = b.g[i]; if (!byG.has(k)) byG.set(k, []); byG.get(k).push(b.t[i]); }
+    let g1ok = 0, g1wrap = 0, g1bad = 0;
+    for (const ts of byG.values()) {
+      if (ts.length !== 3) continue;
+      ts.sort((x, y) => x - y);
+      if (ts[2] - ts[0] > 1000) { g1wrap++; continue; }
+      if (ts[1] - ts[0] === 5 && ts[2] - ts[1] === 5) g1ok++; else g1bad++;
+    }
+    add('trace 배율', 'g1 복제본 내부 간격 5ms·5ms 유지', g1bad === 0 && g1ok + g1wrap === 3, `유지 ${g1ok} · 감기로 경계 넘음 ${g1wrap} · 깨짐 ${g1bad}`);
+    add('trace 배율', '같은 시드 두 번 → 같은 결과', dump(b) === dump(b2), '');
+    add('trace 배율', '결과가 t_ms 오름차순', sortedOk(b), '');
+
+    const h = run(0.5, 30000, 1), h2 = run(0.5, 30000, 1);
+    add('trace 배율', '배율 0.5 → 1·3·4·6건 중 하나', [1, 3, 4, 6].includes(h.n), `${h.n}건`);
+    add('trace 배율', '배율 0.5 · 같은 시드 → 같은 결과', dump(h) === dump(h2), '');
+    const seen = new Set(); let allIn = true;
+    for (let s = 1; s <= 40; s++) { const x = run(0.5, 30000, s).n; seen.add(x); if (![1, 3, 4, 6].includes(x)) allIn = false; }
+    add('trace 배율', '배율 0.5 · 시드 1~40 모두 허용값', allIn, `나온 값 ${[...seen].sort((p, q) => p - q).join(', ')}`);
+
+    // 엔진 재생: 도착 시각이 프레임·틱(4ms)에 뭉개지지 않고 t_ms 그대로 들어가는가
+    const data = { t: ev.t, op: ev.op, n: ev.n, dur: 10000, loop: false };
+    const rp = replayTraceHeadless(data, 12);
+    add('trace 재생', '6건 도착', rp.tr.injected === 6, `${rp.tr.injected}건`);
+    add('trace 재생', '도착 시각 = t_ms 그대로', JSON.stringify(rp.tr.log) === '[1000,1005,1010,5000,5020,7000]', JSON.stringify(rp.tr.log));
+    add('trace 재생', 'loop=false → 끝난 뒤 유입 0', rp.tr.done && rp.tr.injected === 6, '');
+    const rl = replayTraceHeadless(Object.assign({}, data, { loop: true }), 24.5);
+    add('trace 재생', 'loop=true → 24.5초에 15건 (6+6+3)', rl.tr.injected === 15, `${rl.tr.injected}건`);
+    const sumCls = (hist) => { const s = [0, 0, 0]; for (const x of hist) (x.cls || []).forEach((c, i) => { if (i < 3) s[i] += c.done; }); return s; };
+    const mixOnRun = replayTraceHeadless(data, 12, { mixOn: true });
+    add('trace 재생', '작업 구성 켬 → 유형 = op (조회 4 · 검색 0 · 쓰기 2)', sumCls(mixOnRun.history).join(',') === '4,0,2', sumCls(mixOnRun.history).join(','));
+    const mixOffRun = replayTraceHeadless(data, 12, { mixOn: false });
+    const outOff = mixOffRun.history.reduce((s, x) => s + x.out, 0);
+    add('trace 재생', '작업 구성 끔 → 기본 시간 (유형 집계 0, 완료 6)', sumCls(mixOffRun.history).join(',') === '0,0,0' && outOff === 6, `유형 ${sumCls(mixOffRun.history).join(',')} · 완료 ${outOff}`);
+  }
+
+  // ── 잘못된 입력 ──
+  const tr = (events, extra) => JSON.stringify(Object.assign({}, base, { mode: 'trace', name: 'x', duration_ms: 10000, events }, extra || {}));
+  const cv = (tracks, extra) => JSON.stringify(Object.assign({}, base, { mode: 'curve', name: 'x', duration_ms: 10000, tracks }, extra || {}));
+  const BAD = [
+    ['curve t_ms 역순', cv({ rps: [{ t_ms: 1000, v: 1 }, { t_ms: 500, v: 2 }] }), '역순'],
+    ['curve 같은 t_ms 3개', cv({ rps: [{ t_ms: 0, v: 0 }, { t_ms: 1000, v: 1 }, { t_ms: 1000, v: 2 }, { t_ms: 1000, v: 3 }] }), '3개 이상'],
+    ['curve 없는 트랙 키', cv({ rps: [{ t_ms: 0, v: 1 }], nopeKey: [{ t_ms: 0, v: 1 }] }), 'nopeKey'],
+    ['curve tracks.rps 누락', cv({ dbScale: [{ t_ms: 0, v: 1 }] }), 'tracks.rps'],
+    ['curve 마지막 t_ms > duration', cv({ rps: [{ t_ms: 0, v: 1 }, { t_ms: 20000, v: 1 }] }), 'duration_ms'],
+    ['trace op 오타', tr([{ t_ms: 0, op: 'raed' }]), '"raed"'],
+    ['trace t 필드 사용', tr([{ t: 1000, op: 'read' }]), '`t_ms`(밀리초)를 사용하세요'],
+    ['trace t_ms 범위 (= duration)', tr([{ t_ms: 10000, op: 'read' }]), '미만'],
+    ['trace events 빈 배열', tr([]), 'events가 비어'],
+    ['params 없는 키', tr([{ t_ms: 0, op: 'read' }], { params: { fooBar: 1 } }), 'fooBar'],
+    ['format 누락', JSON.stringify({ version: 1, mode: 'trace', name: 'x', duration_ms: 1, events: [{ t_ms: 0, op: 'read' }] }), 'format'],
+    ['duration 단위 없음', JSON.stringify(Object.assign({}, base, { mode: 'trace', name: 'x', duration: 10, events: [{ t_ms: 0, op: 'read' }] })), '`duration_ms`(밀리초)'],
+    ['JSON 파싱 실패', '{ "format": ', 'JSON 파싱 실패'],
+    ['빈 파일', '   ', '빈 파일'],
+  ];
+  for (const [label, text, needle] of BAD) {
+    const res = parseScenarioFile(text);
+    add('검증', label, !res.ok && res.errors.some(e => e.includes(needle)), res.ok ? '오류 없이 통과됨' : res.errors[0]);
+  }
+  const uns = parseScenarioFile(tr([{ t_ms: 500, op: 'read' }, { t_ms: 100, op: 'write' }]));
+  add('검증', '정렬 안 된 events → 정렬 + 경고', uns.ok && uns.warnings.length === 1 && uns.scenario.events.t[0] === 100, uns.ok ? uns.warnings[0] : uns.errors[0]);
+
+  // ── vote_site_2026-09-14.json (화면에서 불러와 둔 경우에만) ──
+  const vote = Object.values(SCENARIOS).find(s => s.file && s.file.mode === 'trace' && s.file.source && s.file.source.type === 'supabase' && s.file.events.n === 886);
+  if (!vote) add('vote_site', '불러온 파일 없음', null, '화면에서 scenarios/vote_site_2026-09-14.json 을 불러온 뒤 다시 실행');
+  else {
+    const ev = vote.file.events;
+    add('vote_site', '886건', ev.n === 886, `${ev.n}건`);
+    add('vote_site', '묶음 211개', ev.groupCount === 211, `${ev.groupCount}개`);
+    add('vote_site', '길이 686951ms', vote.file.duration_ms === 686951, `${vote.file.duration_ms}ms`);
+    add('vote_site', '조회 811 · 쓰기 75', ev.opCount[0] === 811 && ev.opCount[2] === 75, `조회 ${ev.opCount[0]} · 검색 ${ev.opCount[1]} · 쓰기 ${ev.opCount[2]}`);
+    const one = scaleTrace(ev, { N: 1, jitter_ms: 30000, seed: 1, exclude_src: TRACE_EXCLUDE_DEFAULT, duration_ms: 686951 });
+    const rv = replayTraceHeadless({ t: one.t, op: one.op, n: one.n, dur: 686951, loop: false }, 690);
+    add('vote_site', '배율 1 재생 → 약 687초 동안 886건', rv.tr.injected === 886 && rv.tr.done && rv.tr.lastT <= 686951,
+      `${rv.tr.injected}건 · 마지막 도착 ${(rv.tr.lastT / 1000).toFixed(2)}초`);
+  }
+
+  console.table(rows);
+  const s = { 통과: rows.filter(r => r.결과 === '통과').length, 실패: rows.filter(r => r.결과 === '실패').length, 건너뜀: rows.filter(r => r.결과 === '건너뜀').length };
+  console.log(`[runScenarioSelfTest] 통과 ${s.통과} · 실패 ${s.실패} · 건너뜀 ${s.건너뜀}`);
+  return s;
 }
 
 
@@ -490,8 +979,8 @@ function drawTimeline(sim) {
   }
   // 시나리오 단계 마커
   const sc = SCENARIOS[scenarioKey];
-  if (sc.period && H.length) { const base = scenarioStart / 1000, tEnd = H[H.length - 1].t;
-    for (let k = 0; base + k * sc.period <= tEnd; k++) for (const st of sc.explain) { const t = base + k * sc.period + st.t; if (t < t0 || t > tEnd) continue; const x = X(t);
+  if ((sc.period || sc.file) && H.length) { const base = scenarioStart / 1000, tEnd = H[H.length - 1].t, reps = sc.period ? Infinity : 1;
+    for (let k = 0; k < reps && base + k * (sc.period || 0) <= tEnd; k++) for (const st of sc.explain) { const t = base + k * (sc.period || 0) + st.t; if (t < t0 || t > tEnd) continue; const x = X(t);
       tctx.strokeStyle = COL.axis; tctx.setLineDash([2, 4]); tctx.beginPath(); tctx.moveTo(x, padT); tctx.lineTo(x, h - padB); tctx.stroke(); tctx.setLineDash([]);
       tctx.fillStyle = COL.muted; tctx.font = '10px "Noto Sans KR", system-ui, sans-serif'; tctx.textBaseline = 'bottom'; tctx.textAlign = 'left'; tctx.fillText(`▸${st.t}s`, x + 2, h - padB - 2); tctx.textBaseline = 'middle'; } }
   // x축
