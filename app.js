@@ -88,10 +88,10 @@ function syncInstModels() {
 }
 function scenarioMarks() {
   const sc = SCENARIOS[scenarioKey], out = [];
-  if (!sc || !sc.period || !sc.explain) return out;
-  const base = scenarioStart / 1000, tEnd = CLOCK.t / 1000;
-  for (let k = 0; k < 200 && base + k * sc.period <= tEnd; k++)
-    for (const st of sc.explain) { const t = base + k * sc.period + st.t; if (t <= tEnd) out.push({ t, text: st.text }); }
+  if (!sc || !(sc.period || sc.file) || !sc.explain) return out;
+  const base = scenarioStart / 1000, tEnd = CLOCK.t / 1000, per = sc.period || 0, reps = sc.period ? 200 : 1;   // 반복하지 않는 파일 시나리오는 한 번만
+  for (let k = 0; k < reps && base + k * per <= tEnd; k++)
+    for (const st of sc.explain) { const t = base + k * per + st.t; if (t <= tEnd) out.push({ t, text: st.text }); }
   return out;
 }
 function updateStats() {
@@ -112,7 +112,9 @@ function frame(now) {
   const real = Math.min(100, now - last); last = now;
   if (!PLAY.paused) {
     applyScenario({ S: { t: CLOCK.t } });                  // BASE → MODEL, 시나리오가 덮어쓴다
-    if (scenarioKey !== 'manual' && !DATA.cur) { $('rps').value = MODEL.rps; $('rpsVal').textContent = MODEL.rps; }
+    // trace 파일은 도착을 인스턴스 시뮬마다 직접 넣는다. 유입 표시는 최근 1초 실제 도착 수
+    for (const it of INST.list) { const r = syncTrace(it.sim); if (r != null) MODEL.rps = r; }
+    if (scenarioKey !== 'manual' && !DATA.cur) { $('rps').value = MODEL.rps; $('rpsVal').textContent = Math.round(MODEL.rps); }
     syncInstModels();
     acc += real;
     while (acc >= MODEL.dt) { for (const it of INST.list) it.sim.step(MODEL.dt); CLOCK.t += MODEL.dt; acc -= MODEL.dt; }
@@ -358,6 +360,126 @@ $('cfgPreviewAll').addEventListener('click', () => {
   };
   next();
 });
+
+/* =====================================================================
+ * 11. 시나리오 파일 — docs/scenario-format.md 형식의 JSON 을 불러와 트래픽 드롭다운에 등록
+ *   파싱·배율·재생은 engine.js 4b. 여기는 파일 읽기(file.text — file:// 로 열어도 동작)와 옵션 UI 뿐이다.
+ *   배율 옵션은 불러온 파일마다 따로 기억한다.
+ * ===================================================================== */
+const SCF = { files: new Map(), cur: null, timer: 0 };
+const SCF_DEFAULT = { N: 1, jitter_ms: 30000, seed: 1, excl: true };
+const fmtRps = (v) => v >= 100 ? Math.round(v).toLocaleString() : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+function fmtDur(ms) {
+  const s = ms / 1000, txt = `${Number.isInteger(s) ? s : s.toFixed(2)}초`;
+  return s >= 60 ? `${txt} (${Math.floor(s / 60)}분 ${Math.round(s % 60)}초)` : txt;
+}
+function showScErrors(errs, title) {
+  $('scFileErr').innerHTML = errs.length
+    ? `<b>${esc(title || '오류')}</b><ul>${errs.map(e => `<li>${esc(e)}</li>`).join('')}</ul><div>이전 시나리오를 그대로 유지합니다.</div>`
+    : '';
+}
+function selectScenarioKey(key) {
+  let o = [...scSel.options].find(x => x.value === key);
+  if (!o) { o = document.createElement('option'); o.value = key; scSel.appendChild(o); }
+  o.textContent = SCENARIOS[key].name;
+  scSel.value = key;
+  scSel.dispatchEvent(new Event('change'));   // 기존 처리: scenarioKey · params 반영 · 0초부터 다시
+}
+// 배율을 적용해 등록하고 0초부터 재생. 실패하면 SCENARIOS 는 그대로다
+function applyScFile(st) {
+  const o = st.opts;
+  const r = registerFileScenario(st.sc, { N: o.N, jitter_ms: o.jitter_ms, seed: o.seed, exclude_src: o.excl ? TRACE_EXCLUDE_DEFAULT : [] });
+  if (!r.ok) { showScErrors(r.errors, '배율 적용 실패'); return false; }
+  st.before = r.before; st.after = r.after;
+  selectScenarioKey(r.key);
+  return true;
+}
+async function loadScenarioFile(file) {
+  if (!file) return;
+  let text;
+  try { text = await file.text(); } catch (e) { showScErrors([`파일을 읽지 못했습니다: ${e.message}`], `불러오기 실패 — ${file.name}`); return; }
+  const res = parseScenarioFile(text);
+  if (!res.ok) { showScErrors(res.errors, `불러오기 실패 — ${file.name}`); return; }
+  const key = 'file:' + res.scenario.name;
+  const st = { key, sc: res.scenario, fileName: file.name, warnings: res.warnings, opts: Object.assign({}, SCF_DEFAULT) };
+  if (!applyScFile(st)) return;
+  SCF.files.set(key, st); SCF.cur = key;
+  showScErrors([]); syncScInputs(st); renderScFile();
+}
+function syncScInputs(st) {
+  $('scN').value = st.opts.N; $('scJitter').value = st.opts.jitter_ms; $('scSeed').value = st.opts.seed; $('scExcl').checked = st.opts.excl;
+  syncJitterBtns();
+}
+// 흩뜨림 값이 버튼 값과 같으면 그 버튼을 강조 (고급에서 다른 값을 넣으면 둘 다 꺼진다)
+function syncJitterBtns() {
+  document.querySelectorAll('#scJitterRow [data-j]').forEach(b => b.classList.toggle('on', +b.dataset.j === +$('scJitter').value));
+}
+function readScInputs() {
+  const N = +$('scN').value, J = +$('scJitter').value, seed = Number($('scSeed').value), errs = [];
+  if (!(N >= 0.1 && N <= 1000)) errs.push('배율 N은 0.1 ~ 1000 사이여야 합니다.');
+  if (!(J >= 0 && J <= 600000)) errs.push('흩뜨림 범위는 0 ~ 600000ms 사이여야 합니다.');
+  if (!Number.isInteger(seed)) errs.push('시드는 정수여야 합니다.');
+  if (errs.length) { showScErrors(errs, '배율 옵션 오류'); return null; }
+  return { N, jitter_ms: J, seed, excl: $('scExcl').checked };
+}
+function onScOpt() {
+  syncJitterBtns();
+  clearTimeout(SCF.timer);
+  SCF.timer = setTimeout(() => {
+    const st = SCF.files.get(SCF.cur); if (!st) return;
+    const o = readScInputs(); if (!o) return;
+    st.opts = o;
+    if (applyScFile(st)) { showScErrors([]); renderScFile(); }
+  }, 300);
+}
+// 화면에는 이름 · 모드 · 길이 · 요청 수 · 작업 비율만. 출처 · 원본 파일명 · 시작 시각 · 묶음 수는 이름에 마우스를 올리면 보인다
+function renderScFile() {
+  const st = SCF.files.get(SCF.cur), box = $('scScale');
+  $('scFileBox').classList.toggle('loaded', SCF.files.size > 0);
+  if (!st) { $('scFileInfo').innerHTML = ''; box.style.display = 'none'; return; }
+  const sc = st.sc, src = sc.source || {}, isTrace = sc.mode === 'trace', ev = sc.events;
+  const origin = [src.type || '출처 미상', src.synthetic === true ? '합성' : src.synthetic === false ? '실측' : null, src.truncated ? '일부 구간' : null].filter(Boolean).join(' · ');
+  const tip = [`파일 ${st.fileName}`, `출처 ${origin}`, sc.loop ? '반복 재생' : '1회 재생',
+    src.start_utc && `시작 ${src.start_utc} (UTC)`,
+    isTrace && `묶음 ${ev.groupCount.toLocaleString()}개 (함께 발생한 요청 단위 — 배율은 묶음째 복제)`,
+    sc.description].filter(Boolean).join('\n');
+  // trace 의 조회·검색·쓰기 구성 (0 인 유형은 뺀다). 작업 구성이 꺼져 있으면 유형과 관계없이 서버 설정의 DB 시간을 쓴다
+  const ops = isTrace ? [['조회', ev.opCount[0]], ['검색', ev.opCount[1]], ['쓰기', ev.opCount[2]]].filter(p => p[1] > 0) : [];
+  const H = [`<div class="scname" title="${esc(tip)}"><b>${esc(sc.name)}</b></div>`,
+    `<div class="kv"><span><b>${sc.mode}</b></span><span>${fmtDur(sc.duration_ms)}</span>${isTrace ? `<span>요청 <b>${ev.n.toLocaleString()}</b>건</span>` : ''}`
+    + (ops.length ? `<span>${ops.map(([k, v]) => `${k} ${Math.round(v / ev.n * 100)}%`).join(' · ')}</span>` : '') + `</div>`];
+  for (const w of st.warnings) H.push(`<div class="scwarn">${esc(w)}</div>`);
+  $('scFileInfo').innerHTML = H.join('');
+  box.style.display = '';
+  $('scJitterRow').style.display = isTrace ? '' : 'none';
+  $('scAdv').style.display = isTrace ? '' : 'none';
+  $('scExclRow').style.display = isTrace && ev.srcNames.some(s => TRACE_EXCLUDE_DEFAULT.includes(s)) ? '' : 'none';   // 크론·관리자 요청이 있는 파일에서만
+  const b = st.before, a = st.after, head = `<tr><th></th><th>원본</th><th>×${st.opts.N}</th></tr>`;
+  const table = (R) => head + R.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td><td><b>${r[2]}</b></td></tr>`).join('');
+  $('scStats').innerHTML = table([['평균 rps', fmtRps(b.meanRps), fmtRps(a.meanRps)],
+    isTrace ? ['가장 붐빈 1초', b.peak.toLocaleString(), a.peak.toLocaleString()] : ['최대 rps', fmtRps(b.peak), fmtRps(a.peak)]]);
+  $('scStats2').innerHTML = isTrace ? table([['총 요청', b.n.toLocaleString(), a.n.toLocaleString()], ['배율 대상 묶음', b.bundles.toLocaleString(), a.bundles.toLocaleString()]]) : '';
+}
+// 드롭다운에서 다른 파일 시나리오를 고르면 그 파일의 정보·옵션을 보여 준다
+scSel.addEventListener('change', () => {
+  if (SCF.files.has(scSel.value) && SCF.cur !== scSel.value) { SCF.cur = scSel.value; syncScInputs(SCF.files.get(SCF.cur)); renderScFile(); }
+});
+$('btnScFile').addEventListener('click', () => $('scFileInput').click());
+$('scFileInput').addEventListener('change', (e) => { loadScenarioFile(e.target.files[0]); e.target.value = ''; });
+{
+  const box = $('scFileBox');
+  box.addEventListener('dragenter', (e) => { e.preventDefault(); box.classList.add('drag'); });
+  box.addEventListener('dragover', (e) => { e.preventDefault(); box.classList.add('drag'); });
+  box.addEventListener('dragleave', (e) => { if (!box.contains(e.relatedTarget)) box.classList.remove('drag'); });
+  box.addEventListener('drop', (e) => { e.preventDefault(); box.classList.remove('drag'); loadScenarioFile(e.dataTransfer && e.dataTransfer.files[0]); });
+  // 상자 밖에 떨어뜨려도 브라우저가 JSON 파일로 이동해 버리지 않게
+  window.addEventListener('dragover', (e) => e.preventDefault());
+  window.addEventListener('drop', (e) => e.preventDefault());
+}
+for (const id of ['scN', 'scJitter', 'scSeed']) $(id).addEventListener('input', onScOpt);
+$('scExcl').addEventListener('change', onScOpt);
+document.querySelectorAll('#scScale [data-n]').forEach(b => b.addEventListener('click', () => { $('scN').value = b.dataset.n; onScOpt(); }));
+document.querySelectorAll('#scJitterRow [data-j]').forEach(b => b.addEventListener('click', () => { $('scJitter').value = b.dataset.j; onScOpt(); }));
 
 /* ── 시작 ── */
 fillScenarios();

@@ -1,0 +1,23 @@
+{
+  "format": "reinforcebean-scenario",
+  "version": 1,
+  "mode": "trace",
+  "name": "테스트용 작은 재생 데이터",
+  "description": "배율·흩뜨림 동작 검증용. 사용자 묶음 2개(5건) + 크론 1건",
+  "duration_ms": 10000,
+  "loop": false,
+  "source": { "type": "handmade", "synthetic": true },
+  "events": [
+    { "t_ms": 1000, "op": "read",  "ep": "GET products",  "g": 1, "src": "user" },
+    { "t_ms": 1005, "op": "read",  "ep": "GET banners",   "g": 1, "src": "user" },
+    { "t_ms": 1010, "op": "read",  "ep": "GET notices",   "g": 1, "src": "user" },
+    { "t_ms": 5000, "op": "write", "ep": "POST orders",   "g": 2, "src": "user" },
+    { "t_ms": 5020, "op": "read",  "ep": "GET orders",    "g": 2, "src": "user" },
+    { "t_ms": 7000, "op": "write", "ep": "PATCH matches",         "src": "cron" }
+  ],
+  "explain": [
+    { "t_ms": 1000, "text": "사용자 묶음 1: 조회 3건이 10ms 안에" },
+    { "t_ms": 5000, "text": "사용자 묶음 2: 쓰기 1건 + 조회 1건" },
+    { "t_ms": 7000, "text": "크론 1건 (배율과 무관하게 1번만)" }
+  ]
+}
