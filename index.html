@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ReinforceBean — EC2 인스턴스 부하 비교</title>
+<title>Preflight — EC2 인스턴스 분석</title>
 <style>
   /* ── 디자인 토큰: slate 계열 + 파랑 강조 1색, 각진 모서리, 그림자 없음 ── */
   :root {
@@ -56,17 +56,20 @@
   header span.st { font-size: 11px; color: var(--muted); }
   header span.st b { color: var(--ink); font-variant-numeric: tabular-nums; }
 
-  /* 3열 × 3행. 왼쪽은 입력, 가운데는 위에서 아래로 「리스트 → 요청 흐름 → 실시간 비교」.
-     고르는 것(리스트)이 맨 위, 고른 결과가 어디서 막히는지(흐름)가 그 밑, 시간에 따른 변화가 맨 아래.
-     오른쪽은 판단에 필요한 것만 — 병목 · 추천 · 모델 보정. */
-  main { display: grid; grid-template-columns: 208px minmax(0, 1fr) 386px;
-    grid-template-rows: minmax(0, 0.38fr) minmax(130px, 0.28fr) minmax(0, 0.34fr); min-height: 0; }
+  /* 왼쪽 입력 열 + 본문. 본문은 위에서 아래로 「리스트 → 요청 흐름 → (실시간 비교 | 결과)」.
+     리스트·흐름도는 전체 폭을 쓰고, 결과(추천·병목·보정)는 맨 아래 오른쪽에만 둔다. */
+  main { display: grid; grid-template-columns: 208px minmax(0, 1fr) 520px;
+    grid-template-rows: minmax(0, 0.33fr) minmax(155px, 0.31fr) minmax(0, 0.36fr); min-height: 0; }
   aside { display: flex; flex-direction: column; overflow: auto; padding: 5px 9px 8px; }
   #left  { grid-column: 1; grid-row: 1 / 4; border-right: 1px solid var(--border); }
-  #right { grid-column: 3; grid-row: 1 / 4; border-left: 1px solid var(--border); }
-  #stageWrap { grid-column: 2; grid-row: 2; margin: 3px 6px 3px; }
-  #listWrap  { grid-column: 2; grid-row: 1; margin: 6px 6px 3px; display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  /* 결과 영역 — 추천·병목을 나란한 두 열로, 보정은 아래 전체 폭 */
+  #right { grid-column: 3; grid-row: 3; border-left: 1px solid var(--border); border-top: 1px solid var(--border);
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; align-content: start; }
+  #right .panel:last-child { grid-column: 1 / -1; }
+  #right .tiles { grid-template-columns: repeat(2, 1fr); }
+  #stageWrap { grid-column: 2 / 4; grid-row: 2; margin: 3px 6px 3px; }
+  #listWrap  { grid-column: 2 / 4; grid-row: 1; margin: 6px 6px 3px; display: grid;
+    grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
     background: var(--surface); border: 1px solid var(--border); min-height: 0; }
   #cmpWrap   { grid-column: 2; grid-row: 3; margin: 3px 6px 6px; }
 
@@ -84,9 +87,15 @@
   .listhead input[type=text] { width: 84px; flex: none; }
   .listhead button { flex: none; padding: 1px 6px; font-size: 10px; }
   .listbody { flex: 1; min-height: 0; overflow: auto; padding: 4px 6px 6px; }
-  /* 아주 넓은 화면에서 이름 칸만 늘어나 숫자가 멀어지지 않게 — 읽는 폭을 묶어 둔다 */
-  #instTable table.ctab { max-width: 700px; }
-  #cfgTable { max-width: 1180px; }
+  #instTable table.stab tbody tr { cursor: pointer; }
+  /* 두 리스트 모두 좌우 스크롤 없이 들어가게 촘촘히 */
+  #listWrap table.stab th { font-size: 9px; padding: 3px 2px; }
+  #listWrap table.stab td { font-size: 10px; padding: 2px 2px; }
+  #listWrap table.stab td.cell b { font-size: 9.5px; }
+  #listWrap table.stab td.name { max-width: 80px; }
+  #listWrap .listbody { padding: 4px 3px 6px; }
+  #listWrap table.stab td .act { gap: 2px; }
+  #listWrap table.stab td .act button { padding: 1px 3px; font-size: 9px; }
 
   /* 두 줄짜리 행: 아랫줄(.sub)은 조건·근거 */
   tr.sub td { padding: 0 4px 4px; border-bottom: 1px solid var(--border); }
@@ -229,24 +238,29 @@
   table.stab td.pv.on { color: var(--ink); font-weight: 700; }
   table.stab td.pv.bad { color: var(--bad); font-weight: 700; }
 
-  /* ── 추천 (우측) — 결론 한 줄이 아니라 근거·대안·값까지 ── */
-  #advice .head { display: flex; align-items: baseline; gap: 6px; padding: 5px 8px; background: var(--accent-soft);
+  /* ── 추천 — 결론 + 수치 근거 + 더 싼 후보의 탈락 이유 ── */
+  #advice .head { display: flex; align-items: baseline; gap: 6px; padding: 8px 10px; background: var(--accent-soft);
     border: 1px solid var(--accent-border); border-left: 3px solid var(--accent); }
-  #advice .head b { font-size: 14px; color: var(--ink); }
+  #advice .head b { font-size: 16px; color: var(--ink); }
   #advice .head .sub { font-size: 10.5px; color: var(--ink-2); }
   #advice .head .cost { margin-left: auto; font-size: 12px; font-weight: 700; color: var(--accent-strong); font-variant-numeric: tabular-nums; }
   #advice.bad .head { background: var(--bad-soft); border-color: #eccfcd; border-left-color: var(--bad); }
   #advice.bad .head b { color: var(--bad); }
-  #advice .head { padding: 8px 10px; }
-  #advice .head b { font-size: 16px; }
+  #advice .why { font-size: 11px; color: var(--ink-2); font-variant-numeric: tabular-nums;
+    padding: 5px 10px; border: 1px solid var(--grid); border-top: 0; background: var(--surface-soft); }
+  #advice .why b { color: var(--accent-strong); }
+  #advice .alt { font-size: 10.5px; color: var(--ink-2); font-variant-numeric: tabular-nums;
+    display: flex; justify-content: space-between; gap: 8px; padding: 3px 10px; border-bottom: 1px solid var(--grid); }
+  #advice .alt b { color: var(--ink); font-weight: 600; }
+  #advice .alt .r { color: var(--bad); }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>ReinforceBean <small>부하 테스트 중 — 어느 EC2 인스턴스면 충분한가</small></h1>
+  <h1>Preflight</h1>
   <div class="spacer"></div>
-  <span class="slo-inline">목표 p95 <input type="number" id="sloP95" value="300" min="10" step="10"> ms · 실패 <input type="number" id="sloErr" value="1" min="0" step="0.5"> %</span>
+  <span class="slo-inline">목표 — 95% 응답시간 ≤ <input type="number" id="sloP95" value="300" min="10" step="10"> ms · 실패 ≤ <input type="number" id="sloErr" value="1" min="0" step="0.5"> %</span>
   <button id="btnPause">일시정지</button>
   <button id="btnReset">처음으로</button>
   <span class="st">시뮬 <b id="simClock">0.0s</b></span>
@@ -263,18 +277,18 @@
     </div>
 
     <div class="panel">
-      <h2>서버 설정 <small>모든 인스턴스 공통</small></h2>
+      <h2>서버 설정</h2>
       <div class="ctl"><label>스레드 <b id="threadsVal">50</b></label><input type="range" id="threads" min="1" max="400" step="1" value="50"></div>
       <div class="ctl"><label>DB 커넥션 <b id="connsVal">20</b></label><input type="range" id="conns" min="1" max="60" step="1" value="20"></div>
       <div class="ctl"><label>대기 큐 <b id="qcapVal">100</b></label><input type="range" id="qcap" min="10" max="1000" step="10" value="100"></div>
       <div class="ctl"><label>DB 시간 <b><span id="dbtVal">30</span> ms</b></label><input type="range" id="dbt" min="5" max="300" step="1" value="30"></div>
       <div class="ctl"><label>요청당 CPU <b><span id="cpumsVal">8</span> ms</b></label><input type="range" id="cpums" min="0" max="60" step="1" value="8"></div>
       <div class="ctl"><label>타임아웃 <b><span id="toVal">3000</span> ms</b></label><input type="range" id="to" min="500" max="10000" step="500" value="3000"></div>
-      <div class="row" style="margin-top:6px"><button id="cfgSave" title="지금 슬라이더 값 한 벌을 가운데 「설정 시나리오」에 저장">＋ 지금 설정을 시나리오로 저장</button></div>
+      <div class="row" style="margin-top:6px"><button id="cfgSave">＋ 지금 설정을 시나리오로 저장</button></div>
     </div>
 
     <div class="panel">
-      <h2>비교할 인스턴스 <small>최대 4대</small></h2>
+      <h2>비교할 인스턴스</h2>
       <div class="row"><select id="instPick"></select></div>
       <div class="row"><button class="primary" id="instAdd">＋ 추가</button><button id="instPreset">기본 3종</button></div>
       <div id="instList"></div>
@@ -298,9 +312,9 @@
         <button class="fbtn" data-filter="ok">만족</button>
         <button class="fbtn" data-filter="no">미달</button>
         <div class="spacer"></div>
-        <input type="text" id="cfgName" placeholder="이름" maxlength="40" title="저장할 이름 (비우면 자동)">
-        <button class="primary" id="cfgSave2" title="지금 슬라이더 값 한 벌을 저장">＋ 저장</button>
-        <button id="cfgPreviewAll" title="모든 행을 헤드리스로 돌려 예측을 채운다">전부 미리보기</button>
+        <input type="text" id="cfgName" placeholder="이름" maxlength="40">
+        <button class="primary" id="cfgSave2">＋ 저장</button>
+        <button id="cfgPreviewAll">전부 미리보기</button>
       </div>
       <div class="listbody"><table class="stab" id="cfgTable"></table></div>
     </div>
@@ -308,7 +322,6 @@
     <div class="listcol">
       <div class="listhead">
         <b>인스턴스 비교</b>
-        <span>최근 10초 평균 · 행을 누르면 위 흐름도가 그 인스턴스로 바뀐다</span>
       </div>
       <div class="listbody"><div id="instTable"></div></div>
     </div>
@@ -324,30 +337,30 @@
   <!-- ─────────── 결과 ─────────── -->
   <aside id="right">
     <div class="panel">
+      <h2>최종 추천</h2>
+      <div id="advice"></div>
+    </div>
+
+    <div class="panel">
       <h2>병목 <small id="bnWho"></small></h2>
       <div id="bottleneck" data-level="ok"><div class="t">정상</div><div class="d"></div></div>
       <div class="tiles">
         <div class="tile"><div class="k">처리량</div><div class="v"><span id="mThr">0</span><small>rps</small></div></div>
-        <div class="tile"><div class="k">p95</div><div class="v"><span id="mP95">0</span><small>ms</small></div></div>
+        <div class="tile"><div class="k">95% 응답시간</div><div class="v"><span id="mP95">0</span><small>ms</small></div></div>
         <div class="tile"><div class="k">실패</div><div class="v"><span id="mErr">0</span><small>/s</small></div></div>
         <div class="tile"><div class="k">이 인스턴스 최대</div><div class="v"><span id="tCap">0</span><small>rps</small></div></div>
       </div>
     </div>
 
     <div class="panel">
-      <h2>추천 <small>목표를 만족하는 것 중 가장 싼 인스턴스</small></h2>
-      <div id="advice"></div>
-    </div>
-
-    <div class="panel">
       <h2>모델 보정 <small id="calibState">보정 전</small></h2>
       <div class="row">
         <button class="primary" id="btnCalib">실측으로 보정 · 검증</button>
-        <button id="btnCsv" title="직접 측정한 CSV 로 보정">CSV</button>
-        <button id="btnReport" title="현재 비교 결과를 마크다운으로 저장">리포트</button>
+        <button id="btnCsv">CSV</button>
+        <button id="btnReport">리포트</button>
       </div>
       <input type="file" id="csvFile" accept=".csv,text/csv" style="display:none">
-      <div id="calibOut" class="note">실측 CSV의 일부 rps로만 모델을 맞추고, 맞추지 않은 rps에서 예측이 맞는지 확인한다.</div>
+      <div id="calibOut" class="note"></div>
     </div>
   </aside>
 </main>

@@ -30,7 +30,12 @@ function instBaseline(type) {
 const instThreadCap = (gb) => Math.max(1, Math.floor(gb * 1024 * (1 - MEM_RESERVE) / MEM_PER_THREAD_MB));
 
 const INST_COL = ['#1f6feb', '#b45309', '#0f766e', '#7c3aed', '#b0201a', '#475569'];
-const INST = { list: [], sel: 0, seq: 0 };
+const INST = { list: [], sel: 0, seq: 0, hl: false };   // hl: 사용자가 클릭으로 하나를 강조한 상태 (차트의 나머지는 흑백)
+// 클릭 선택 — 같은 것을 다시 누르면 강조 해제 (전부 제 색으로)
+function instPick(i) {
+  if (INST.hl && INST.sel === i) INST.hl = false;
+  else { INST.sel = i; INST.hl = true; }
+}
 const MONTH = 730;   // 시간 → 월 환산
 
 // 인스턴스 한 대 = 자기 모델 파라미터(M) + 자기 시뮬레이션. 같은 트래픽을 동시에 먹인다.
@@ -52,7 +57,7 @@ const instSel = () => INST.list[Math.min(INST.sel, INST.list.length - 1)] || nul
 function renderInstList() {
   const el = $('instList');
   el.innerHTML = INST.list.map((it, i) => `
-    <div class="inst${i === INST.sel ? ' on' : ''}" data-i="${i}" title="클릭 → 단면도에 이 인스턴스를 띄운다">
+    <div class="inst${i === INST.sel ? ' on' : ''}" data-i="${i}">
       <i class="cdot" style="background:${it.color}"></i>
       <b>${it.type}</b>
       <span class="spec">${it.vcpu} vCPU · ${it.gb}GB · 스레드 ≤${it.threadCap}${it.baseline < 1 ? ` · 지속 ${Math.round(it.baseline * 100)}%` : ''}</span>
@@ -62,7 +67,7 @@ function renderInstList() {
   el.querySelectorAll('.inst').forEach(d => d.addEventListener('click', (e) => {
     const i = +d.dataset.i;
     if (e.target.classList.contains('del')) { INST.list.splice(i, 1); if (INST.sel >= INST.list.length) INST.sel = Math.max(0, INST.list.length - 1); recolor(); }
-    else INST.sel = i;
+    else instPick(i);
     renderInstList();
   }));
 }
@@ -108,71 +113,80 @@ function instStats(it) {
     usdPer100: out > 1 ? it.usd * MONTH / (out / 100) : null,     // 실제로 처리한 100rps 당 월 비용
   };
 }
-const bar = (frac, tone) => `background:linear-gradient(to right, ${tone} ${Math.round(Math.max(0, Math.min(1, frac)) * 100)}%, transparent 0)`;
-// 자원 이용률 칩 하나: 숫자 + 길이가 곧 이용률인 짧은 막대
-const uchip = (k, u) => `<span>${k} <b class="${u > .9 ? 'bd' : u > .75 ? 'wr' : ''}">${Math.round(u * 100)}%</b>`
-  + `<span class="mini${u > .9 ? ' hot' : ''}"><i style="width:${Math.round(Math.max(0, Math.min(1, u)) * 100)}%"></i></span></span>`;
-
+// 설정 시나리오 표와 같은 인셀 차트 — 셀이 칠해진 길이가 곧 그 값의 크기다.
+//   결과 칸(95% 응답·처리량·실패)은 목표·유입 대비, 자원 칸(CPU·스레드·커넥션)은 이용률 그대로.
 function renderInstTable() {
   const p95T = +$('sloP95').value, errT = +$('sloErr').value / 100;
   const rows = INST.list.map(it => ({ it, s: instStats(it) })).filter(r => r.s);
-  if (!rows.length) { $('instTable').innerHTML = '<div class="none">부하 테스트 시작 중…</div>'; return; }
-  // 반쪽 폭 — 윗줄은 판정에 쓰는 것(p95·완료·실패·값), 아랫줄은 그 판정이 나온 조건(자원·여유·한계)
-  const H = ['<table class="ctab"><thead><tr><th class="name">인스턴스</th>'
-    + '<th class="sep">p95</th><th>완료</th><th>실패</th><th>$/월</th></tr></thead><tbody>'];
+  if (!rows.length) { $('instTable').innerHTML = '<div class="none">측정 중…</div>'; return; }
+  const W = (f) => `<i class="fill" style="width:${Math.round(Math.max(0, Math.min(1, f)) * 100)}%"></i>`;
+  const usdMax = Math.max(1, ...rows.map(r => r.s.usdMonth));
+  const util = (v, sep) => `<td class="cell${sep ? ' sep' : ''}${v > .9 ? ' hot' : v > .75 ? ' warm' : ''}">`
+    + `${W(v)}<b>${Math.round(v * 100)}%</b></td>`;
+  const H = [`<table class="stab"><thead><tr><th class="l">인스턴스</th>`
+    + `<th>95% 응답</th><th>처리량</th><th>실패</th>`
+    + `<th class="sep">CPU</th><th>스레드</th><th>커넥션</th><th>여유</th>`
+    + `<th class="sep">$/월</th><th>판정</th></tr></thead><tbody>`];
   for (const { it, s } of rows) {
     const ok = s.p95 <= p95T && s.errRate <= errT;
     const burst = it.baseline < 1 && s.cpU > it.baseline;
     const slack = Math.max(0, 1 - s.rho);       // 이론 최대 대비 남은 여유
-    const i = INST.list.indexOf(it), selCls = it === instSel() ? 'sel ' : '';
-    H.push(`<tr class="${selCls}${ok ? '' : 'no'}" data-i="${i}"`
-      + ` title="${it.type} · ${it.vcpu}vCPU / ${it.gb}GB · 스레드 상한 ${it.threadCap} · 이론 최대 ${s.cap.toFixed(0)}rps">`
-      + `<td class="name"><i class="cdot" style="background:${it.color}"></i>${it.type}`
-      + (burst ? ' <span class="pill warn" title="버스터블 기준 이용률을 넘었다 — 크레딧이 떨어지면 스로틀된다">버스트</span>' : '')
-      + (ok ? '' : ' <span class="pill no">미달</span>') + `</td>`
-      + `<td class="sep big" style="${bar(s.p95 / Math.max(1, p95T), s.p95 > p95T ? 'var(--bad-soft)' : 'var(--accent-soft)')}">${fmt(s.p95)} ms</td>`
-      + `<td>${fmt(s.out)}/s</td>`
-      + `<td style="${s.errRate > errT ? 'color:var(--bad);font-weight:700' : ''}">${(s.errRate * 100).toFixed(1)}%</td>`
-      + `<td class="big">$${Math.round(s.usdMonth)}</td></tr>`);
-    H.push(`<tr class="sub ${selCls}" data-i="${i}"><td colspan="5"><div class="chips">`
-      + `<span>${it.vcpu} vCPU</span>`
-      + uchip('CPU', s.cpU) + uchip('스레드', s.thU) + uchip('커넥션', s.coU)
-      + `<span title="이론 최대 ${s.cap.toFixed(0)}rps 대비 지금 유입 ${s.inRate.toFixed(0)}rps">여유 `
-      + `<b class="${slack <= .1 ? 'bd' : slack <= .3 ? 'wr' : 'hi'}">${Math.round(slack * 100)}%</b></span>`
-      + `<span>이론 최대 <b>${s.cap.toFixed(0)}rps</b></span>`
-      + `<span title="실제로 처리한 100rps 당 월 비용 — 싸도 못 처리하면 비싼 것이다">100rps당 `
-      + `<b>${s.usdPer100 == null ? '—' : '$' + Math.round(s.usdPer100)}</b></span>`
-      + `</div></td></tr>`);
+    const i = INST.list.indexOf(it), sel = it === instSel();
+    H.push(`<tr class="${sel ? 'now' : ''}" data-i="${i}"`
+      + ` title="${it.type} · ${it.vcpu}vCPU / ${it.gb}GB · 스레드 상한 ${it.threadCap}">`
+      + `<td class="l name"><i class="cdot" style="background:${it.color}"></i> ${it.type}`
+      + (burst ? ' <span class="pill warn">버스트</span>' : '') + `</td>`
+      + `<td class="cell${s.p95 > p95T ? ' hot' : ' d'}" title="목표 ${p95T}ms">`
+      + `${W(s.p95 / Math.max(1, p95T))}<b>${fmt(s.p95)}ms</b></td>`
+      + `<td class="cell d" title="유입 ${s.inRate.toFixed(0)}rps 중 완료 ${s.out.toFixed(0)}/s">`
+      + `${W(s.out / Math.max(1, s.inRate))}<b>${fmt(s.out)}</b></td>`
+      + `<td class="cell${s.errRate > errT ? ' hot' : s.errRate > 0.001 ? ' warm' : ' zero'}" title="허용 ${(errT * 100).toFixed(1)}%">`
+      + `${W(s.errRate / Math.max(.001, errT))}<b>${(s.errRate * 100).toFixed(1)}%</b></td>`
+      + util(s.cpU, true) + util(s.thU) + util(s.coU)
+      + `<td class="cell${slack <= .1 ? ' hot' : slack <= .3 ? ' warm' : ' d'}" title="이론 최대 ${s.cap.toFixed(0)}rps">${W(slack)}<b>${Math.round(slack * 100)}%</b></td>`
+      + `<td class="cell sep" title="100rps당 ${s.usdPer100 == null ? '—' : '$' + Math.round(s.usdPer100)}">`
+      + `${W(s.usdMonth / usdMax * 0.92)}<b>$${Math.round(s.usdMonth)}</b></td>`
+      + `<td><span class="pill ${ok ? 'ok' : 'no'}">${ok ? '만족' : '미달'}</span></td></tr>`);
   }
   H.push('</tbody></table>');
   $('instTable').innerHTML = H.join('');
-  $('instTable').querySelectorAll('tbody tr').forEach(tr => tr.addEventListener('click', () => { INST.sel = +tr.dataset.i; renderInstList(); }));
+  $('instTable').querySelectorAll('tbody tr').forEach(tr => tr.addEventListener('click', () => { instPick(+tr.dataset.i); renderInstList(); }));
 }
 
-/* ── 6c. 추천 — 결론 한 줄이 아니라 "왜 이것인가 / 더 싼 것은 왜 안 되나"까지 ──
-   고르는 규칙은 하나다: 목표(p95·실패)를 만족하는 것 중 가장 싼 것.
-   다만 그 한 줄만 두면 믿을 근거가 없으므로, 목표 대비 여유와 탈락 이유를 같이 보인다.  */
+/* ── 6c. 추천 — 목표를 만족하는 것 중 가장 싼 인스턴스 + 수치 근거 + 더 싼 것의 탈락 이유 ── */
+function failWhy(s, p95T, errT) {
+  if (s.p95 > p95T) return `95% 응답 ${Math.round(s.p95)}ms > ${p95T}ms`;
+  if (s.errRate > errT) return `실패 ${(s.errRate * 100).toFixed(1)}% > ${(errT * 100).toFixed(1)}%`;
+  return '';
+}
 function renderAdvice() {
   const el = $('advice'); if (!el) return;
   const p95T = +$('sloP95').value, errT = +$('sloErr').value / 100;
-  const rows = INST.list.map(it => ({ it, s: instStats(it) })).filter(r => r.s);
-  if (!rows.length) { el.className = ''; el.innerHTML = '<div class="none">부하 테스트 시작 중…</div>'; return; }
-  // 목표(p95·실패)를 만족하는 것 중 가장 싼 것 — 결론은 「무엇을 얼마에」 한 줄이면 된다.
-  // 왜 그런지(자원·여유·탈락 이유)는 위 인스턴스 비교 리스트와 병목 판정이 이미 들고 있다.
-  const okRows = rows.filter(r => r.s.p95 <= p95T && r.s.errRate <= errT).sort((a, b) => a.it.usd - b.it.usd);
-  if (!okRows.length) {
+  const rows = INST.list.map(it => ({ it, s: instStats(it) })).filter(r => r.s)
+    .sort((a, b) => a.it.usd - b.it.usd);
+  if (!rows.length) { el.className = ''; el.innerHTML = '<div class="none">측정 중…</div>'; return; }
+  const pick = rows.find(r => r.s.p95 <= p95T && r.s.errRate <= errT);
+  if (!pick) {
     el.className = 'bad';
-    el.innerHTML = `<div class="head"><b>버티는 인스턴스가 없다</b>`
-      + `<span class="sub">유입 ${rows[0].s.inRate.toFixed(0)}rps · 목표 p95 ${p95T}ms</span></div>`;
+    el.innerHTML = `<div class="head"><b>만족하는 인스턴스 없음</b>`
+      + `<span class="sub">유입 ${rows[0].s.inRate.toFixed(0)}rps</span></div>`
+      + rows.map(r => `<div class="alt"><b>${r.it.type}</b> $${Math.round(r.s.usdMonth)}/월`
+        + `<span class="r">${failWhy(r.s, p95T, errT)}</span></div>`).join('');
     return;
   }
-  const pick = okRows[0], s = pick.s;
+  const s = pick.s;
   const burst = pick.it.baseline < 1 && s.cpU > pick.it.baseline;
+  const cheaper = rows.filter(r => r.it.usd < pick.it.usd);
   el.className = '';
   el.innerHTML = `<div class="head"><b>${pick.it.type}</b>`
     + `<span class="sub">${pick.it.vcpu} vCPU · ${pick.it.gb}GB</span>`
-    + (burst ? ' <span class="pill warn" title="버스터블 기준 이용률을 넘었다 — 크레딧이 떨어지면 스로틀된다">버스트 의존</span>' : '')
-    + `<span class="cost">$${Math.round(s.usdMonth)}<span style="font-size:9px;color:var(--muted)">/월</span></span></div>`;
+    + (burst ? ' <span class="pill warn">버스트 의존</span>' : '')
+    + `<span class="cost">$${Math.round(s.usdMonth)}<span style="font-size:9px;color:var(--muted)">/월</span></span></div>`
+    + `<div class="why">95% 응답 <b>${Math.round(s.p95)}ms</b> ≤ ${p95T}ms`
+    + ` · 실패 <b>${(s.errRate * 100).toFixed(1)}%</b> ≤ ${(errT * 100).toFixed(1)}%`
+    + ` · 여유 <b>${Math.round(Math.max(0, 1 - s.rho) * 100)}%</b> (최대 ${s.cap.toFixed(0)}rps)</div>`
+    + cheaper.map(r => `<div class="alt"><b>${r.it.type}</b> $${Math.round(r.s.usdMonth)}/월`
+      + `<span class="r">${failWhy(r.s, p95T, errT)}</span></div>`).join('');
 }
 
 /* =====================================================================
@@ -297,7 +311,7 @@ async function calibrate() {
 
     const H = [`<div class="kv"><span>실측 <b>${VERIFY.real.length}점</b> (${VERIFY.src})</span>`
       + `<span>보정 <b>${CALIB.fitRps.join(', ')}</b> rps</span><span>검증 <b>${CALIB.holdRps.join(', ')}</b> rps</span></div>`];
-    H.push(`<table class="t"><tr><th>rps (보정 미사용)</th><th>실측 p95</th><th>보정 전</th><th>보정 후</th></tr>`);
+    H.push(`<table class="t"><tr><th>rps (보정 미사용)</th><th>실측 95% 응답</th><th>보정 전</th><th>보정 후</th></tr>`);
     for (const r of rows) {
       const b = relErr(r.before, r.real), a = relErr(r.after, r.real);
       H.push(`<tr><td>${r.rps}</td><td>${Math.round(r.real)} ms</td>`
@@ -335,40 +349,42 @@ $('csvFile').addEventListener('change', (e) => {
  * ===================================================================== */
 function reportMarkdown() {
   const p95T = +$('sloP95').value, errT = +$('sloErr').value;
-  const L = [`# ReinforceBean — EC2 인스턴스 비교`, ``, `생성: ${new Date().toISOString()}`, ``];
+  const L = [`# Preflight — EC2 인스턴스 비교`, ``, `생성: ${new Date().toISOString()}`, ``];
   L.push(`## 부하 조건`, ``,
     `- 유입: ${MODEL.rps} rps (시나리오 ${SCENARIOS[scenarioKey].name})`,
     `- 서버 설정: 스레드 ${BASE.threads} / DB 커넥션 ${BASE.conns} / 대기 큐 ${BASE.queueCap} / 타임아웃 ${BASE.timeoutMs}ms`,
     `- 작업: DB ${BASE.dbTimeMs}ms + 앱 CPU ${MODEL.cpuTimeMs}ms per 요청`,
-    `- 목표: p95 ≤ ${p95T}ms · 실패 ≤ ${errT}%`, ``);
+    `- 목표: 95% 응답시간 ≤ ${p95T}ms · 실패 ≤ ${errT}%`, ``);
   L.push(`## 인스턴스 비교 (현재 시점)`, ``,
-    `| 인스턴스 | vCPU | 메모리 | 스레드 상한 | CPU | 스레드 | 커넥션 | p95 | 완료 | 실패 | $/월 | 판정 |`,
+    `| 인스턴스 | vCPU | 메모리 | 스레드 상한 | CPU | 스레드 | 커넥션 | 95% 응답 | 완료 | 실패 | $/월 | 판정 |`,
     `|---|---|---|---|---|---|---|---|---|---|---|---|`);
-  for (const it of INST.list) {
+  const sorted = INST.list.slice().sort((a, b) => a.usd - b.usd);
+  let pick = null;
+  for (const it of sorted) {
     const s = instStats(it); if (!s) continue;
     const ok = s.p95 <= p95T && s.errRate <= errT * 0.01;
+    if (ok && !pick) pick = { it, s };
     L.push(`| ${it.type} | ${it.vcpu} | ${it.gb}GB | ${it.threadCap} | ${Math.round(s.cpU * 100)}% | ${Math.round(s.thU * 100)}% | ${Math.round(s.coU * 100)}%`
       + ` | ${Math.round(s.p95)}ms | ${Math.round(s.out)}/s | ${(s.errRate * 100).toFixed(1)}% | $${Math.round(it.usd * MONTH)} | ${ok ? '만족' : '미달'} |`);
   }
   L.push(``, `가격 출처: ${PRICE.src}`, ``);
+  L.push(`## 최종 추천`, ``);
+  L.push(pick
+    ? `**${pick.it.type}** ($${Math.round(pick.s.usdMonth)}/월) — 목표를 만족하는 것 중 가장 싸다. `
+      + `95% 응답 ${Math.round(pick.s.p95)}ms ≤ ${p95T}ms · 실패 ${(pick.s.errRate * 100).toFixed(1)}% ≤ ${errT}% · 여유 ${Math.round(Math.max(0, 1 - pick.s.rho) * 100)}%`
+    : `만족하는 인스턴스 없음`, ``);
   L.push(`## 모델 보정`, ``);
   L.push(CALIB
     ? `- 실측 ${VERIFY.real.length}점 (${CALIB.src}) 중 ${CALIB.fitRps.join(', ')} rps 로만 보정, ${CALIB.holdRps.join(', ')} rps 로 검증\n`
       + `- **holdout 평균 상대오차 ${(CALIB.errBefore * 100).toFixed(0)}% → ${(CALIB.errAfter * 100).toFixed(0)}%**\n`
       + `- DB ${CALIB.dbNom.toFixed(0)}ms → ${CALIB.dbCal.toFixed(0)}ms · α=${CALIB.alpha} · γ=${CALIB.gamma}`
-    : `_보정하지 않음 — 아래 수치는 보정 전 모델의 예측이다._`, ``);
-  L.push(`## 가정과 한계`, ``,
-    `- vCPU 당 성능은 세대·패밀리와 무관하게 같다고 본다 (실제로는 c 계열이 더 빠르다).`,
-    `- 메모리는 스레드 상한으로만 반영한다 (스레드당 ${MEM_PER_THREAD_MB}MB, OS·런타임 ${MEM_RESERVE * 100}% 예약).`,
-    `- 버스터블(t 계열)은 기준 이용률만 표시하고 크레딧 소진은 시뮬레이션하지 않는다.`,
-    `- DB 는 모든 인스턴스가 공유하는 같은 조건으로 두었다 (RDS 사이징·IOPS·복제 미반영).`,
-    `- 네트워크·EBS 대역폭, 오토스케일링은 고려하지 않는다.`, ``);
+    : `_보정하지 않음_`, ``);
   return L.join('\n');
 }
 $('btnReport').addEventListener('click', () => {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([reportMarkdown()], { type: 'text/markdown' }));
-  a.download = `reinforcebean_${MODEL.rps}rps.md`; a.click();
+  a.download = `preflight_${MODEL.rps}rps.md`; a.click();
 });
 
 fillCatalog();

@@ -232,30 +232,30 @@ function detectBottleneck(S, M) {
   const nomDb = effTimes(Object.assign({}, BASE, { dbScale: 1 })).db;   // 설정상 기대되는 DB 시간 (작업 구성 가중평균)
   // 관측된 DB 처리시간(완료 요청의 db 구간 평균)이 기준의 1.8배 이상 + 커넥션 포화 = 슬로우 쿼리
   if (h.coU > 0.9 && h.dbMean > nomDb * 1.8)
-    return { level: 'bad', title: '슬로우 쿼리 → 커넥션 고갈', desc: `DB 처리시간이 ${Math.round(nomDb)}ms → ${Math.round(h.dbMean)}ms로 늘어 유입(${M.rps}rps)이 그대로인데 커넥션이 100% 점유. 앱 서버 CPU/스레드는 멀쩡해 보인다 — 커넥션 증설은 증상 완화일 뿐, 원인은 쿼리/DB에 있다` };
+    return { level: 'bad', title: '슬로우 쿼리 → 커넥션 고갈', desc: `DB ${Math.round(nomDb)}ms → ${Math.round(h.dbMean)}ms · 커넥션 ${Math.round(h.coU * 100)}% 점유` };
   // 작업 구성 진단: 소수 비율의 무거운 작업이 DB 시간의 대부분을 먹는 경우 (같은 rps라도 구성이 다르면 병목이 다르다)
   if (M.mixOn && M.mix) {
     let tot = 0; const load = M.mix.map(m => { const l = m.share * m.dbTimeMs; tot += l; return l; });
     let hi = 0; for (let i = 1; i < load.length; i++) if (load[i] > load[hi]) hi = i;
     const heavy = M.mix[hi], loadShare = tot > 0 ? load[hi] / tot : 0;
     if (rhoMax > 0.7 && loadShare > 0.5 && heavy.share < 0.35)
-      return { level: 'warn', title: `작업 구성 편중 — "${heavy.name}"`, desc: `요청의 ${Math.round(heavy.share * 100)}%뿐인 「${heavy.name}」(DB ${heavy.dbTimeMs}ms)가 DB 시간의 ${Math.round(loadShare * 100)}%를 쓴다. 유입 총량이 아니라 <b>구성</b>이 병목을 만든 상태 — 이 작업의 비율이 조금만 늘어도 용량이 급격히 준다. 자원 증설보다 이 작업의 쿼리/캐시가 먼저다 (ρ=${rhoMax.toFixed(2)})` };
+      return { level: 'warn', title: `작업 구성 편중 — "${heavy.name}"`, desc: `요청의 ${Math.round(heavy.share * 100)}%가 DB 시간의 ${Math.round(loadShare * 100)}% 사용 · ρ ${rhoMax.toFixed(2)}` };
   }
   if (h.q > M.queueCap * 0.25 && errRate < 0.02 && h.p95 > 600)
-    return { level: 'bad', title: '큐 지연 축적 (숨은 장애)', desc: `실패율 ${(errRate * 100).toFixed(1)}%로 대시보드는 초록인데 p95 ${Math.round(h.p95)}ms, 큐 ${h.q}/${M.queueCap}. 큐가 크면 "안 죽는" 대신 모두가 느려진다 — 에러율만 보는 알람은 이걸 놓친다. 큐를 줄이고 빨리 실패시키는 편이 낫다 (병목: ${th.dbBottle ? 'DB 커넥션' : '스레드'})` };
+    return { level: 'bad', title: '큐 지연 축적 (숨은 장애)', desc: `실패 ${(errRate * 100).toFixed(1)}% · 95% 응답 ${Math.round(h.p95)}ms · 큐 ${h.q}/${M.queueCap}` };
   if (retryShare > 0.25 && h.coU > 0.85)
-    return { level: 'bad', title: '재시도 폭풍 (metastable)', desc: `유입의 ${(retryShare * 100).toFixed(0)}%가 재시도, 서버 작업 중 ${h.wasted}/s는 이미 포기한 클라이언트를 위한 낭비. 부하가 줄어도 재시도가 자리를 채워 스스로 회복하지 못한다 — 재시도 backoff/서킷브레이커, 취소 전파, 또는 유입 차단이 필요` };
+    return { level: 'bad', title: '재시도 폭풍 (metastable)', desc: `유입의 ${(retryShare * 100).toFixed(0)}%가 재시도 · 낭비 ${h.wasted}/s` };
   if (M.cores && h.cpU > 0.9 && (h.cw || 0) >= 1)
-    return { level: 'bad', title: `CPU 포화 — vCPU ${M.cores}개 부족`, desc: `코어 ${M.cores}개가 계속 100%. 요청 ${h.cw}건이 DB를 끝내고도 CPU를 기다린다. 이론상 이 코어 수로는 ${Math.round(th.capC)}rps가 한계 (유입 ${M.rps}rps) — 커넥션·스레드를 늘려도 나아지지 않는다. 더 큰 인스턴스(vCPU↑) 또는 요청당 CPU 시간 감소가 답이다` };
+    return { level: 'bad', title: `CPU 포화 — vCPU ${M.cores}개 부족`, desc: `코어 ${M.cores}개 100% · CPU 대기 ${h.cw}건 · 한계 ${Math.round(th.capC)}rps < 유입 ${M.rps}rps` };
   if (h.coU > 0.9 && h.wc >= Math.max(3, M.threads * 0.2))
-    return { level: 'bad', title: 'DB 커넥션 병목', desc: `스레드 ${h.wc}개가 커넥션을 못 얻어 놀고 있음. 스레드를 늘려도 나아지지 않는다 — 커넥션 풀을 늘리거나 DB 처리시간을 줄일 것 (ρ_db=${th.rhoD.toFixed(2)})` };
+    return { level: 'bad', title: 'DB 커넥션 병목', desc: `커넥션 대기 스레드 ${h.wc}개 · ρ_db ${th.rhoD.toFixed(2)}` };
   if (h.thU > 0.9 && h.q > 0)
-    return { level: 'bad', title: '스레드 포화', desc: `모든 스레드가 실제 작업 중이고 큐가 쌓임 (ρ_thread=${th.rhoT.toFixed(2)}). 스레드를 늘리면 개선된다 — 커넥션 여유가 있을 때까지만` };
+    return { level: 'bad', title: '스레드 포화', desc: `스레드 ${Math.round(h.thU * 100)}% · 큐 ${h.q} · ρ_thread ${th.rhoT.toFixed(2)}` };
   if (errRate > 0.05)
-    return { level: 'bad', title: '유입 과다', desc: `요청의 ${(errRate * 100).toFixed(0)}%가 거절/타임아웃. 이론 최대 처리량 ${th.cap.toFixed(0)}rps 대비 유입 ${M.rps}rps` };
+    return { level: 'bad', title: '유입 과다', desc: `실패 ${(errRate * 100).toFixed(0)}% · 최대 ${th.cap.toFixed(0)}rps < 유입 ${M.rps}rps` };
   if (rhoMax > 0.75)
-    return { level: 'warn', title: '임계 접근', desc: `이용률 ρ=${rhoMax.toFixed(2)}. 여기서부터 대기시간이 비선형으로 폭발한다 (${th.dbBottle ? 'DB 커넥션' : '스레드'} 단계)` };
-  return { level: 'ok', title: '정상', desc: `여유 있음 (ρ=${rhoMax.toFixed(2)}, 최대 ${th.cap.toFixed(0)}rps)` };
+    return { level: 'warn', title: '임계 접근', desc: `ρ ${rhoMax.toFixed(2)} (${th.dbBottle ? 'DB 커넥션' : '스레드'})` };
+  return { level: 'ok', title: '정상', desc: `ρ ${rhoMax.toFixed(2)} · 최대 ${th.cap.toFixed(0)}rps` };
 }
 
 /* =====================================================================
@@ -348,23 +348,40 @@ function flowBand(x0, c0, t0, x1, c1, t1, col, alpha) {
   sctx.globalAlpha = alpha == null ? .9 : alpha; sctx.fillStyle = col; sctx.fill(); sctx.globalAlpha = 1;
 }
 // 자원 칸 안에 들어가는 최근 추세 — 지금 값만으로는 "오르는 중인지"를 못 본다.
-// 세로축은 0~100% 고정이라 칸끼리 바로 견줄 수 있고, ref(버스터블 기준선)는 점선으로 깐다.
+// y축 0~100% 고정(눈금 0·50·100%), x축은 최근 N초. ref(버스터블 기준선)는 점선으로 깐다.
 function microSpark(x, y, w, h, vals, col, ref) {
-  sctx.fillStyle = '#f4f7fa'; sctx.fillRect(x, y, w, h);
+  const axL = 26, axB = 11;                                 // 축 라벨 자리 (왼쪽·아래)
+  const gx = x + axL, gw = w - axL, gy = y, gh = h - axB;
+  sctx.fillStyle = '#f4f7fa'; sctx.fillRect(gx, gy, gw, gh);
+  // 가로 격자 + y 눈금
+  sctx.lineWidth = 1;
+  for (const [f, lb] of [[1, '100%'], [.5, '50'], [0, '0']]) {
+    const yy = gy + gh - f * gh;
+    sctx.strokeStyle = f > 0 ? INK.line : COL.axis;
+    sctx.beginPath(); sctx.moveTo(gx, yy); sctx.lineTo(gx + gw, yy); sctx.stroke();
+    txt(lb, gx - 3, Math.max(gy + 4, Math.min(yy, gy + gh - 3)), 'right', INK.lab, FONT('8px'));
+  }
+  // y축
+  sctx.strokeStyle = COL.axis;
+  sctx.beginPath(); sctx.moveTo(gx, gy); sctx.lineTo(gx, gy + gh); sctx.stroke();
   if (vals && vals.length > 1) {
-    const px = (i) => x + i / (vals.length - 1) * w, py = (v) => y + h - Math.max(0, Math.min(1, v)) * h;
-    sctx.beginPath(); sctx.moveTo(px(0), y + h);
+    const px = (i) => gx + i / (vals.length - 1) * gw, py = (v) => gy + gh - Math.max(0, Math.min(1, v)) * gh;
+    sctx.beginPath(); sctx.moveTo(px(0), gy + gh);
     vals.forEach((v, i) => sctx.lineTo(px(i), py(v)));
-    sctx.lineTo(px(vals.length - 1), y + h); sctx.closePath();
+    sctx.lineTo(px(vals.length - 1), gy + gh); sctx.closePath();
     sctx.globalAlpha = .18; sctx.fillStyle = col; sctx.fill(); sctx.globalAlpha = 1;
     sctx.beginPath(); vals.forEach((v, i) => i ? sctx.lineTo(px(i), py(v)) : sctx.moveTo(px(i), py(v)));
     sctx.strokeStyle = col; sctx.lineWidth = 1.2; sctx.stroke();
   }
   if (ref != null && ref > 0 && ref < 1) {
-    const ry = y + h - ref * h;
+    const ry = gy + gh - ref * gh;
     sctx.setLineDash([2, 2]); sctx.strokeStyle = INK.warn; sctx.lineWidth = 1;
-    sctx.beginPath(); sctx.moveTo(x, ry); sctx.lineTo(x + w, ry); sctx.stroke(); sctx.setLineDash([]);
+    sctx.beginPath(); sctx.moveTo(gx, ry); sctx.lineTo(gx + gw, ry); sctx.stroke(); sctx.setLineDash([]);
   }
+  // x 눈금 — 최근 N초 전 → 지금
+  const span = vals && vals.length > 1 ? vals.length - 1 : 30;
+  txt(`-${span}s`, gx, y + h - 4, 'left', INK.lab, FONT('8px'));
+  txt('0s', gx + gw, y + h - 4, 'right', INK.lab, FONT('8px'));
 }
 // 길목의 자원 한 칸 — 채움이 곧 이용률, 아래 추세선이 곧 방향
 function flowNode(x, y, nw, nh, o) {
@@ -404,11 +421,12 @@ function drawStage(sim) {
   const pad = 8, titleH = 15;
   const top = pad + titleH, bot = h - pad;
   const area = bot - top;
-  const nh = Math.max(64, Math.min(136, area * 0.60));      // 칸을 크게 — 안의 추세 그래프가 이 화면의 본문이다
-  const cy = top + Math.max(nh / 2, area * 0.38);
+  const nh = Math.max(72, Math.min(176, area * 0.72));      // 칸을 크게 — 안의 추세 그래프가 이 화면의 본문이다
+  const cy = top + Math.max(nh / 2, area * 0.40);
   const sinkY = bot - 14;
-  const nw = Math.max(92, Math.min(136, (w - pad * 2) * 0.175));
-  const gap = Math.max(20, (w - pad * 2 - nw * 4 - 46) / 5);
+  // 가로를 최대한 쓴다 — 띠(가지) 간격은 18px 만 남기고 나머지를 전부 칸 폭에 준다
+  const nw = Math.max(104, Math.min(250, (w - pad * 2 - 46 - 18 * 5) / 4));
+  const gap = Math.max(18, (w - pad * 2 - nw * 4 - 46) / 5);
   const X = (i) => pad + gap + i * (nw + gap);
   const xEnd = w - pad - 44;
   const hot = (u) => u > .9 ? INK.hot : u > .75 ? INK.warn : INK.accent;
@@ -426,7 +444,7 @@ function drawStage(sim) {
   txt(`요청 흐름${M.label ? ' · ' + M.label : ''}`, pad, pad + 6, 'left', INK.ink, FONT('700 11px'));
   const BN = { cpu: 'vCPU', db: 'DB 커넥션', thread: '스레드/큐' };
   txt(`유입 ${fmt(hh.in)}/s${hh.retry ? ` (재시도 ${fmt(hh.retry)})` : ''}  ·  완료 ${fmt(hh.out)}/s  ·  실패 ${fmt(hh.rej + hh.to)}/s`
-    + `  ·  p95 ${fmtMs(hh.p95)}  ·  병목 ${BN[th.bottle]}  ·  ρ ${(hh.in / Math.max(1, th.cap)).toFixed(2)}`,
+    + `  ·  95% 응답 ${fmtMs(hh.p95)}  ·  병목 ${BN[th.bottle]}  ·  ρ ${(hh.in / Math.max(1, th.cap)).toFixed(2)}`,
     w - pad, pad + 6, 'right', INK.lab, FONT('10px'));
 
   /* ── 본류 (노드 뒤에 깔린다) ── */
@@ -498,7 +516,7 @@ function drawCompare(list, opts) {
   const { w, h, dpr } = fitCanvas(cmpc);
   cctx.setTransform(dpr, 0, 0, dpr, 0, 0); cctx.clearRect(0, 0, w, h);
   const N = opts.win || 60;
-  const padL = 40, padR = 10, padT = 40, padB = 14, gapY = 18;
+  const padL = 40, padR = 74, padT = 40, padB = 14, gapY = 26;   // 오른쪽은 선 끝 이름 라벨 자리
   const hists = list.map(it => it.sim.S.history);
   const anyH = hists.find(H => H.length) || [];
   if (!anyH.length) {
@@ -509,21 +527,23 @@ function drawCompare(list, opts) {
   }
   const tEnd = anyH[anyH.length - 1].t, t0 = tEnd - N;
   const X = (t) => padL + (t - t0) / N * (w - padL - padR);
+  // dir: 값이 높은 쪽이 나쁜가 좋은가. badFrom/badRef: 이 선 위는 나쁜 영역(빨간 칠)
   const rows = [
-    { title: 'CPU 이용률', unit: '%', fixedMax: 100, get: (d) => (d.cpU || 0) * 100, baseline: true },
-    { title: 'p95 응답', unit: 'ms', get: (d) => d.p95, ref: opts.p95, refName: '목표' },
-    { title: '처리량', unit: '/s', get: (d) => d.out, showIn: true },
+    { title: 'CPU 이용률', unit: '%', fixedMax: 100, get: (d) => (d.cpU || 0) * 100, baseline: true, dir: 'bad', badFrom: 90 },
+    { title: '95% 응답시간', unit: 'ms', get: (d) => d.p95, ref: opts.p95, refName: '목표', dir: 'bad', badRef: true },
+    { title: '처리량', unit: '/s', get: (d) => d.out, showIn: true, dir: 'good' },
   ];
   const ph = (h - padT - padB - gapY * (rows.length - 1)) / rows.length;
 
-  // ── 색은 한 번에 하나만 ────────────────────────────────────────────────
-  //  선이 전부 제 색을 주장하면 "지금 무엇을 보고 있는지"가 흐려진다. 그래서 기본은 검정이고,
-  //  고른 인스턴스(위 흐름도에 띄운 것)만 색으로 앞에 나온다. 나머지는 옅은 검정으로 뒤에 깔린다.
-  const CK = (it) => it.sel ? it.color : INK.ink;          // 선·점·기준선 색
-  const CA = (it) => it.sel ? 1 : 0.45;                    // 안 고른 것은 옅은 검정으로 뒤에
+  // ── 색 규칙 ──────────────────────────────────────────────────────────
+  //  기본은 전부 제 색. 하나를 클릭해 강조하면 그것만 색을 지키고 나머지는 흑백(옅은 검정)으로 물러난다.
+  const anySel = list.some(it => it.sel);
+  const CK = (it) => (!anySel || it.sel) ? it.color : INK.ink;   // 선·점·기준선 색
+  const CA = (it) => (!anySel || it.sel) ? 1 : 0.45;             // 흑백인 것은 옅게 뒤에
+  const LW = (it) => it.sel ? 2.6 : anySel ? 1.3 : 2;
   const zOrder = list.map((it, i) => ({ it, i })).sort((a, b) => (a.it.sel ? 1 : 0) - (b.it.sel ? 1 : 0));
 
-  // 범례 — 선택된 인스턴스(단면도에 뜬 것)는 색 + 굵게. 제목과 겹치지 않게 오른쪽 정렬.
+  // 범례 — 강조된 인스턴스는 굵게. 제목과 겹치지 않게 오른쪽 정렬.
   cctx.textBaseline = 'middle'; cctx.textAlign = 'left';
   const lab = list.map(it => `${it.type} (${it.vcpu}vCPU)`);
   cctx.font = '10.5px "Noto Sans KR", system-ui, sans-serif';
@@ -531,7 +551,7 @@ function drawCompare(list, opts) {
   let lx = Math.max(padL + 150, w - padR - lw.reduce((a, b) => a + b, 0) + 14);
   list.forEach((it, i) => {
     cctx.globalAlpha = CA(it); cctx.fillStyle = CK(it); cctx.fillRect(lx, 7, 9, 9); cctx.globalAlpha = 1;
-    cctx.fillStyle = it.sel ? COL.ink : COL.muted;
+    cctx.fillStyle = (!anySel || it.sel) ? COL.ink : COL.muted;
     cctx.font = `${it.sel ? 700 : 400} 10.5px "Noto Sans KR", system-ui, sans-serif`;
     cctx.fillText(lab[i], lx + 12, 12);
     lx += lw[i];
@@ -547,16 +567,43 @@ function drawCompare(list, opts) {
       max = niceMax(max);
     }
     const Y = (v) => py0 + ph - Math.min(v, max) / max * ph;
+    // 패널 배경·테두리 — 세 지표를 칸으로 분리해 섞여 보이지 않게 한다
+    cctx.fillStyle = COL.surface || '#fff';
+    cctx.fillRect(padL, py0, w - padL - padR, ph);
+    cctx.strokeStyle = COL.axis; cctx.lineWidth = 1;
+    cctx.strokeRect(padL - .5, py0 - .5, w - padL - padR + 1, ph + 1);
+    // 나쁜 영역 — 이 안으로 선이 들어가면 나쁘다 (CPU 90% 위 · 응답시간 목표 위)
+    const badY = p.badFrom != null ? Y(p.badFrom)
+      : (p.badRef && p.ref && p.ref <= max ? Y(p.ref) : null);
+    if (badY != null) {
+      cctx.fillStyle = 'rgba(176,32,26,.07)';
+      cctx.fillRect(padL, py0, w - padL - padR, Math.max(0, badY - py0));
+      if (p.badFrom != null) {
+        cctx.strokeStyle = COL.s_rej; cctx.setLineDash([3, 3]); cctx.lineWidth = 1;
+        cctx.beginPath(); cctx.moveTo(padL, badY); cctx.lineTo(w - padR, badY); cctx.stroke(); cctx.setLineDash([]);
+        cctx.fillStyle = COL.s_rej; cctx.textAlign = 'right'; cctx.textBaseline = 'bottom';
+        cctx.font = '9px "Noto Sans KR", system-ui, sans-serif';
+        cctx.fillText(`위험 ${p.badFrom}%`, w - padR - 2, badY - 1);
+      }
+    }
     // 격자 + y 라벨
     cctx.strokeStyle = COL.grid; cctx.lineWidth = 1; cctx.fillStyle = COL.muted;
     cctx.textAlign = 'right'; cctx.textBaseline = 'middle'; cctx.font = '9px "Noto Sans KR", system-ui, sans-serif';
     for (let i = 0; i <= 2; i++) { const v = max * i / 2, yy = Y(v);
-      cctx.beginPath(); cctx.moveTo(padL, yy); cctx.lineTo(w - padR, yy); cctx.stroke();
+      if (i > 0 && i < 2) { cctx.beginPath(); cctx.moveTo(padL, yy); cctx.lineTo(w - padR, yy); cctx.stroke(); }
       cctx.fillText(fmt(v), padL - 4, yy); }
-    // 소제목 — 패널 위쪽 여백에
+    // 소제목 — 강조 표식 + 굵게 + 방향(↑ 나쁨 / ↑ 좋음)
+    cctx.fillStyle = INK.accent; cctx.fillRect(padL, py0 - 14, 3, 11);
     cctx.textAlign = 'left'; cctx.textBaseline = 'bottom'; cctx.fillStyle = COL.ink;
-    cctx.font = '700 10px "Noto Sans KR", system-ui, sans-serif';
-    cctx.fillText(`${p.title} (${p.unit})`, padL, py0 - 3);
+    cctx.font = '700 11px "Noto Sans KR", system-ui, sans-serif';
+    const tt = `${['①', '②', '③'][ri] || ''} ${p.title} (${p.unit})`;
+    cctx.fillText(tt, padL + 7, py0 - 4);
+    if (p.dir) {
+      const tw = cctx.measureText(tt).width;
+      cctx.fillStyle = p.dir === 'bad' ? COL.s_rej : css('--accent-strong') || INK.accent;
+      cctx.font = '700 9px "Noto Sans KR", system-ui, sans-serif';
+      cctx.fillText(p.dir === 'bad' ? '↑ 나쁨' : '↑ 좋음', padL + 7 + tw + 8, py0 - 4);
+    }
     // 기준선 (목표 p95)
     if (p.ref && p.ref <= max) {
       cctx.strokeStyle = COL.s_rej; cctx.setLineDash([3, 3]); cctx.lineWidth = 1;
@@ -569,7 +616,7 @@ function drawCompare(list, opts) {
     if (p.baseline) for (const it of list) {
       if (!(it.baseline > 0 && it.baseline < 1)) continue;
       const yy = Y(it.baseline * 100);
-      cctx.strokeStyle = CK(it); cctx.globalAlpha = it.sel ? .55 : .28; cctx.setLineDash([2, 4]); cctx.lineWidth = 1;
+      cctx.strokeStyle = CK(it); cctx.globalAlpha = (!anySel || it.sel) ? .55 : .28; cctx.setLineDash([2, 4]); cctx.lineWidth = 1;
       cctx.beginPath(); cctx.moveTo(padL, yy); cctx.lineTo(w - padR, yy); cctx.stroke();
       cctx.setLineDash([]);
       cctx.fillStyle = CK(it); cctx.textAlign = 'left'; cctx.textBaseline = 'bottom';
@@ -577,21 +624,42 @@ function drawCompare(list, opts) {
       cctx.fillText(`${it.type} 지속 ${Math.round(it.baseline * 100)}%`, padL + 3, yy - 2);
       cctx.globalAlpha = 1;
     }
-    // 유입 (공통) — 회색 점선
+    // 유입 (공통) — 회색 점선. 완료 선이 이 선에 붙어 있어야 정상이다
     if (p.showIn) {
       cctx.strokeStyle = COL.s_in; cctx.setLineDash([4, 3]); cctx.lineWidth = 1.5; cctx.beginPath();
-      let first = true;
-      for (const d of anyH) { if (d.t < t0) continue; const x = X(d.t), yy = Y(d.in); first ? cctx.moveTo(x, yy) : cctx.lineTo(x, yy); first = false; }
+      let first = true, fx = 0, fy = 0;
+      for (const d of anyH) { if (d.t < t0) continue; const x = X(d.t), yy = Y(d.in);
+        if (first) { fx = x; fy = yy; cctx.moveTo(x, yy); } else cctx.lineTo(x, yy); first = false; }
       cctx.stroke(); cctx.setLineDash([]);
+      cctx.fillStyle = COL.s_in; cctx.textAlign = 'left'; cctx.textBaseline = 'bottom';
+      cctx.font = '700 9px "Noto Sans KR", system-ui, sans-serif';
+      cctx.fillText('유입 = 목표', fx + 3, fy - 3);
     }
-    // 인스턴스별 실선 — 안 고른 것(검정)을 먼저 깔고, 고른 것(색)을 맨 위에 그린다
+    // 인스턴스별 실선 — 안 고른 것을 먼저 깔고, 고른 것을 맨 위에. 색 + 선 끝 라벨로 구별한다
     for (const { it, i } of zOrder) {
       const H = hists[i]; if (!H.length) continue;
       cctx.strokeStyle = CK(it); cctx.globalAlpha = CA(it);
-      cctx.lineWidth = it.sel ? 2.4 : 1.3; cctx.lineJoin = 'round'; cctx.beginPath();
+      cctx.lineWidth = LW(it); cctx.lineJoin = 'round'; cctx.beginPath();
       let first = true;
       for (const d of H) { if (d.t < t0) continue; const x = X(d.t), yy = Y(p.get(d)); first ? cctx.moveTo(x, yy) : cctx.lineTo(x, yy); first = false; }
       cctx.stroke(); cctx.globalAlpha = 1;
+    }
+    // 선 끝 이름 라벨 — 어느 선이 누구인지 끝에서 바로 읽는다 (겹치면 세로로 밀어낸다)
+    const ends = [];
+    for (const { it, i } of zOrder) {
+      const H = hists[i]; if (!H.length) continue;
+      const d = H[H.length - 1];
+      ends.push({ it, x: X(d.t), py: Y(p.get(d)), ly: Y(p.get(d)) });
+    }
+    ends.sort((a, b) => a.ly - b.ly);
+    for (let k = 1; k < ends.length; k++) if (ends[k].ly - ends[k - 1].ly < 10) ends[k].ly = ends[k - 1].ly + 10;
+    cctx.textAlign = 'left'; cctx.textBaseline = 'middle';
+    for (const e of ends) {
+      cctx.globalAlpha = CA(e.it); cctx.fillStyle = CK(e.it);
+      cctx.beginPath(); cctx.arc(e.x, e.py, e.it.sel ? 3 : 2.3, 0, 7); cctx.fill();
+      cctx.font = `${e.it.sel || !anySel ? 700 : 400} 8.5px "Noto Sans KR", system-ui, sans-serif`;
+      cctx.fillText(e.it.type, e.x + 5, e.ly);
+      cctx.globalAlpha = 1;
     }
     p.Y = Y; p.y0 = py0;
   });
@@ -620,16 +688,15 @@ function drawCompare(list, opts) {
     cctx.strokeStyle = COL.ink2; cctx.setLineDash([2, 3]); cctx.lineWidth = 1;
     cctx.beginPath(); cctx.moveTo(x, padT - 6); cctx.lineTo(x, h - padB); cctx.stroke(); cctx.setLineDash([]);
     for (const p of rows) for (const { it, i } of zOrder) { const d = at(hists[i]); if (!d) continue;
-      cctx.globalAlpha = it.sel ? 1 : .55;
-      cctx.fillStyle = CK(it); cctx.beginPath(); cctx.arc(x, p.Y(p.get(d)), it.sel ? 3.5 : 2.5, 0, 7); cctx.fill();
+      cctx.globalAlpha = (!anySel || it.sel) ? 1 : .55;
+      cctx.fillStyle = CK(it); cctx.beginPath(); cctx.arc(x, p.Y(p.get(d)), it.sel ? 3.5 : anySel ? 2.5 : 3, 0, 7); cctx.fill();
       cctx.strokeStyle = '#fff'; cctx.lineWidth = 1.2; cctx.stroke(); cctx.globalAlpha = 1; }
     tip.style.display = 'block';
-    // 툴팁은 어차피 이름을 쓰므로, 여기서는 색이 아니라 "지금 고른 것"만 표시한다
     tip.innerHTML = `<div class="r"><b>t = ${ref.t.toFixed(0)}s</b><span>유입 ${ref.in}/s</span></div>`
       + list.map((it, i) => { const d = at(hists[i]); return d
-        ? `<div class="r"><span><i style="background:${CK(it)};opacity:${it.sel ? 1 : .35}"></i>`
+        ? `<div class="r"><span><i style="background:${CK(it)};opacity:${(!anySel || it.sel) ? 1 : .35}"></i>`
           + `<b${it.sel ? '' : ' style="font-weight:400"'}>${it.type}</b></span>`
-          + `<span>CPU ${Math.round((d.cpU || 0) * 100)}% · p95 ${fmt(d.p95)}ms · 완료 ${d.out}/s · 실패 ${d.rej + d.to}/s</span></div>` : ''; }).join('');
+          + `<span>CPU ${Math.round((d.cpU || 0) * 100)}% · 95% 응답 ${fmt(d.p95)}ms · 완료 ${d.out}/s · 실패 ${d.rej + d.to}/s</span></div>` : ''; }).join('');
     tip.style.left = Math.min(x + 12, w - tip.offsetWidth - 8) + 'px'; tip.style.top = '6px';
   } else tip.style.display = 'none';
 }

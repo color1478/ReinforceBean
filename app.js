@@ -120,7 +120,7 @@ function frame(now) {
   $('simClock').textContent = (CLOCK.t / 1000).toFixed(1) + 's';
   const sel = instSel();
   if (sel) drawStage(sel.sim);
-  drawCompare(INST.list.map(it => Object.assign({ sel: it === sel }, it)),
+  drawCompare(INST.list.map(it => Object.assign({ sel: INST.hl && it === sel }, it)),
     { win: MODEL.historySec, p95: +$('sloP95').value, marks: scenarioMarks() });
   const sec = Math.floor(CLOCK.t / 1000);
   // 표는 1초에 한 번만 다시 그린다 (좌우 두 리스트 + 추천)
@@ -174,7 +174,7 @@ async function useCurve(id) {
  *   미리보기   : 그 설정으로 헤드리스 20초를 돌려 p95·처리량·실패율을 먼저 본다.
  *                재생 중인 화면은 건드리지 않는다 — 불러오기를 눌러야 실제로 적용된다.
  * ===================================================================== */
-const CFG_KEY = 'reinforcebean.cfgs.v1';
+const CFG_KEY = 'preflight.cfgs.v2';
 const CFG_FIELDS = [
   { k: 'rps',       id: 'rps',     label: '유입',    unit: 'rps' },
   { k: 'threads',   id: 'threads', label: '스레드',  unit: '' },
@@ -182,16 +182,16 @@ const CFG_FIELDS = [
   { k: 'queueCap',  id: 'qcap',    label: '큐',      unit: '' },
   { k: 'dbTimeMs',  id: 'dbt',     label: 'DB',      unit: 'ms' },
   { k: 'cpuTimeMs', id: 'cpums',   label: 'CPU',     unit: 'ms' },
-  { k: 'timeoutMs', id: 'to',      label: '타임아웃', unit: 'ms' },
+  { k: 'timeoutMs', id: 'to',      label: '타임아웃', unit: 'ms', h: '제한(s)' },
 ];
 const CFG_SEED = [
-  { name: '기본 — 스레드 50 · 커넥션 20', scenario: 'manual',
+  { name: '기본', scenario: 'manual',
     cfg: { rps: 250, threads: 50, conns: 20, queueCap: 100, dbTimeMs: 30, cpuTimeMs: 8, timeoutMs: 3000, retryProb: 0 } },
-  { name: '커넥션 10 — 풀이 먼저 막힌다', scenario: 'manual',
+  { name: '커넥션 10', scenario: 'manual',
     cfg: { rps: 250, threads: 50, conns: 10, queueCap: 100, dbTimeMs: 30, cpuTimeMs: 8, timeoutMs: 3000, retryProb: 0 } },
-  { name: '큐 400 · 타임아웃 10s — 에러 없이 느려진다', scenario: 'hiddenq',
+  { name: '큐 400', scenario: 'hiddenq',
     cfg: { rps: 360, threads: 50, conns: 20, queueCap: 400, dbTimeMs: 30, cpuTimeMs: 8, timeoutMs: 10000, retryProb: 0 } },
-  { name: '재시도 90% · 타임아웃 1s — 폭풍 조건', scenario: 'retrystorm',
+  { name: '재시도 폭풍', scenario: 'retrystorm',
     cfg: { rps: 300, threads: 50, conns: 20, queueCap: 400, dbTimeMs: 30, cpuTimeMs: 8, timeoutMs: 1000, retryProb: 0.9 } },
 ];
 const CFGS = { list: [], prev: new Map(), filter: 'all' };   // prev: "행id|인스턴스" → 미리보기 결과 (인스턴스가 바뀌면 다시 잰다)
@@ -226,7 +226,7 @@ const cfgKeyOf = (row) => row.id + '|' + (instSel() ? instSel().type : '-');
 function renderCfgTable() {
   const it = instSel(), cur = curCfg(), p95T = +$('sloP95').value, errT = +$('sloErr').value / 100;
   $('cfgBasis').textContent = it ? `기준 ${it.type} (${it.vcpu} vCPU)` : '인스턴스 없음';
-  const BN = { cpu: 'vCPU', db: 'DB 커넥션', thread: '스레드/큐' };
+  const BN = { cpu: 'CPU', db: 'DB', thread: '스레드' };
   // 한 행이 후보 하나. 설정도 결과도 전부 인셀 차트 — 셀이 칠해진 길이가 그 값의 크기다.
   //   설정 칸 : 슬라이더 최댓값 대비 (지금 설정과 다르면 진하게)
   //   결과 칸 : 목표치 대비 (넘으면 빨갛게) + 「기준(지금 설정)」 대비 증감률
@@ -234,16 +234,9 @@ function renderCfgTable() {
   const slider = (f) => f.max != null ? f.max : (($(f.id) && +$(f.id).max) || 100);
   const pv0 = CFGS.prev.get('now|' + (it ? it.type : '-'));       // 기준 행의 예측 — 증감률의 분모
   const W = (frac) => `<i class="fill" style="width:${Math.round(Math.max(0, Math.min(1, frac)) * 100)}%"></i>`;
-  const dlt = (v, base, lowerBetter) => {
-    if (base == null || !isFinite(base) || base <= 0 || v == null) return '';
-    const d = Math.round((v - base) / base * 100);
-    if (Math.abs(d) < 1) return ' <em>=</em>';
-    const good = lowerBetter ? d < 0 : d > 0;
-    return ` <em class="${good ? 'dn' : 'up'}">${d > 0 ? '+' : ''}${d}%</em>`;
-  };
-  const head = '<tr><th class="l">후보 · 트래픽</th>'
-    + SHOW.map(f => `<th>${f.label}</th>`).join('')
-    + '<th class="sep">예상 p95</th><th>처리량</th><th>실패</th><th class="l">병목</th><th>판정</th><th></th></tr>';
+  const head = '<tr><th class="l">후보</th>'
+    + SHOW.map(f => `<th>${f.h || f.label}</th>`).join('')
+    + '<th class="sep">95% 응답</th><th>실패</th><th class="l">병목</th><th>판정</th><th></th></tr>';
 
   const nowRow = { id: 'now', name: '지금 설정', scenario: scenarioKey, cfg: cur };
   const shown = CFGS.list.filter(r => {
@@ -256,9 +249,6 @@ function renderCfgTable() {
   const all = [nowRow].concat(shown);
   const colMax = {};
   for (const f of SHOW) colMax[f.k] = Math.max(1e-9, ...all.map(r => r.cfg[f.k] || 0));
-  const thrMax = Math.max(1, ...all.map(r => {
-    const pv = r.id === 'now' ? pv0 : CFGS.prev.get(cfgKeyOf(r)); return pv ? pv.thr : 0;
-  }));
 
   const line = (row, isNow) => {
     const c = row.cfg, pv = isNow ? pv0 : CFGS.prev.get(cfgKeyOf(row));
@@ -266,36 +256,36 @@ function renderCfgTable() {
     // ── 설정 셀 ──
     const cells = SHOW.map(f => {
       const v = c[f.k] == null ? 0 : c[f.k], d = !isNow && v !== (cur[f.k] || 0);
-      const txt = f.pct ? (v ? Math.round(v * 100) + '%' : '—') : v + (f.unit || '');
+      const txt = f.pct ? (v ? Math.round(v * 100) + '%' : '—')
+        : f.k === 'timeoutMs' ? String(v / 1000) : String(v);
       return `<td class="cell${d ? ' d' : ''}${v ? '' : ' zero'}"`
-        + ` title="${f.label} ${txt} · 후보 중 최대 ${f.pct ? Math.round(colMax[f.k] * 100) + '%' : colMax[f.k] + (f.unit || '')}`
+        + ` title="${f.label} ${txt}${f.pct ? '' : f.k === 'timeoutMs' ? 's' : (f.unit || '')}`
+        + ` · 후보 중 최대 ${f.pct ? Math.round(colMax[f.k] * 100) + '%' : colMax[f.k] + (f.unit || '')}`
         + ` · 슬라이더 최대 ${f.pct ? '100%' : slider(f) + (f.unit || '')}">`
         + W(v / colMax[f.k] * 0.92) + `<b>${txt}</b></td>`;
     }).join('');
     // ── 결과 셀 ──
     const pvc = pv
-      ? `<td class="cell sep ${pv.p95 > p95T ? 'hot' : ''}" title="목표 ${p95T}ms">${W(pv.p95 / Math.max(1, p95T))}`
-        + `<b>${Math.round(pv.p95)} ms</b>${isNow ? '' : dlt(pv.p95, pv0 && pv0.p95, true)}</td>`
-        + `<td class="cell" title="이론 최대 ${pv.cap.toFixed(0)}rps">${W(pv.thr / thrMax * 0.92)}`
-        + `<b>${pv.thr.toFixed(0)} rps</b>${isNow ? '' : dlt(pv.thr, pv0 && pv0.thr, false)}</td>`
+      ? `<td class="cell sep ${pv.p95 > p95T ? 'hot' : ''}" title="목표 ${p95T}ms · 처리량 ${pv.thr.toFixed(0)}rps · 이론 최대 ${pv.cap.toFixed(0)}rps">${W(pv.p95 / Math.max(1, p95T))}`
+        + `<b>${Math.round(pv.p95)}ms</b></td>`
         + `<td class="cell ${pv.err > errT ? 'hot' : pv.err > 0 ? 'warm' : 'zero'}" title="허용 ${(errT * 100).toFixed(1)}%">`
-        + `${W(Math.min(1, pv.err) / Math.max(.001, errT))}<b>${(Math.min(1, pv.err) * 100).toFixed(1)} %</b></td>`
+        + `${W(Math.min(1, pv.err) / Math.max(.001, errT))}<b>${(Math.min(1, pv.err) * 100).toFixed(1)}%</b></td>`
         + `<td class="l">${BN[pv.bottle]}</td>`
         + `<td><span class="pill ${ok ? 'ok' : 'no'}">${ok ? '만족' : '미달'}</span></td>`
-      : '<td class="sep">—</td><td>—</td><td>—</td><td class="l" style="color:var(--muted)">미리보기 전</td><td>—</td>';
-    const sc = SCENARIOS[row.scenario] ? SCENARIOS[row.scenario].name : (row.scenario || '수동');
-    const act = isNow
-      ? `<div class="act"><button data-pv="now">예측</button></div>`
-      : `<div class="act"><button data-pv="${row.id}" title="이 설정으로 20초 돌려 본 예측">예측</button>`
-        + `<button class="primary" data-load="${row.id}" title="슬라이더·트래픽 시나리오를 이 설정으로">적용</button>`
-        + `<button data-del="${row.id}" title="삭제">✕</button></div>`;
+      : '<td class="sep">—</td><td>—</td><td class="l" style="color:var(--muted)">—</td><td>—</td>';
+    const scName = SCENARIOS[row.scenario] ? SCENARIOS[row.scenario].name : (row.scenario || '');
+    const sc = row.scenario === 'manual' ? ''
+      : scName.replace('장애: ', '').replace(' (슬라이더)', '').replace('실측 곡선: ', '');
+    const act = isNow ? ''
+      : `<div class="act"><button class="primary" data-load="${row.id}">적용</button>`
+        + `<button data-del="${row.id}">✕</button></div>`;
     return `<tr class="${isNow ? 'now' : ''}" data-ok="${ok === null ? '' : ok ? 'ok' : 'no'}">`
-      + `<td class="l name">${isNow ? '▸ 기준 (지금 설정)' : esc(row.name)}`
-      + ` <span style="color:var(--muted);font-weight:400">${esc(sc)}</span></td>`
+      + `<td class="l name" title="${esc(row.name || '')}${sc ? ' · ' + esc(sc) : ''}">${isNow ? '▸ 지금 설정' : esc(row.name)}`
+      + (sc ? ` <span style="color:var(--muted);font-weight:400">${esc(sc)}</span>` : '') + `</td>`
       + `${cells}${pvc}<td>${act}</td></tr>`;
   };
 
-  const nCol = 1 + SHOW.length + 6;
+  const nCol = 1 + SHOW.length + 5;
   $('cfgTable').innerHTML = `<thead>${head}</thead><tbody>`
     + line(nowRow, true) + shown.map(r => line(r, false)).join('')
     + (shown.length ? '' : `<tr><td colspan="${nCol}" class="l" style="color:var(--muted)">`
@@ -308,7 +298,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 function cfgSaveCurrent() {
   const c = curCfg();
   const name = ($('cfgName') && $('cfgName').value.trim())
-    || `${c.rps}rps · 스레드 ${c.threads} · 커넥션 ${c.conns}`;
+    || `${c.rps}rps · ${c.threads}/${c.conns}`;
   CFGS.list.push({ id: 'c' + Date.now().toString(36), name, scenario: scenarioKey, cfg: c });
   cfgStoreSave();
   if ($('cfgName')) $('cfgName').value = '';
@@ -338,13 +328,6 @@ $('cfgTable').addEventListener('click', (e) => {
   const btn = e.target.closest('button'); if (!btn) return;
   if (btn.dataset.del) { CFGS.list = CFGS.list.filter(r => r.id !== btn.dataset.del); cfgStoreSave(); renderCfgTable(); }
   else if (btn.dataset.load) { const r = CFGS.list.find(x => x.id === btn.dataset.load); if (r) cfgApply(r); }
-  else if (btn.dataset.pv) {
-    const id = btn.dataset.pv;
-    const row = id === 'now' ? { id: 'now', cfg: curCfg() } : CFGS.list.find(x => x.id === id);
-    if (!row) return;
-    btn.textContent = '…';
-    setTimeout(() => { CFGS.prev.set(cfgKeyOf(row), cfgPreview(row)); renderCfgTable(); }, 20);
-  }
 });
 // 전부 미리보기: 한 행씩 끊어서 돈다 (재생 중인 화면이 멈춰 보이지 않게)
 $('cfgPreviewAll').addEventListener('click', () => {
