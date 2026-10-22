@@ -56,17 +56,18 @@
   header span.st { font-size: 11px; color: var(--muted); }
   header span.st b { color: var(--ink); font-variant-numeric: tabular-nums; }
 
-  /* 3열 × 3행. 왼쪽은 입력, 가운데는 위에서 아래로 「리스트 → 요청 흐름 → 실시간 비교」.
+  /* 3열 × 3행. 왼쪽은 입력, 맨 위는 리스트가 끝까지 넓게, 그 아래는
+     가운데 열에 「요청 흐름 → 실시간 비교」, 오른쪽 열에 결과(병목 · 추천 · 모델 보정)를 두 줄 높이로.
      고르는 것(리스트)이 맨 위, 고른 결과가 어디서 막히는지(흐름)가 그 밑, 시간에 따른 변화가 맨 아래.
-     오른쪽은 판단에 필요한 것만 — 병목 · 추천 · 모델 보정. */
+     fr 은 정수로 쓴다 — 소수 fr 의 합이 1 아래로 떨어지면(최소 높이에 걸린 줄이 빠지면) 남는 공간을 다 쓰지 않는다. */
   main { display: grid; grid-template-columns: 208px minmax(0, 1fr) 386px;
-    grid-template-rows: minmax(0, 0.38fr) minmax(130px, 0.28fr) minmax(0, 0.34fr); min-height: 0; }
+    grid-template-rows: minmax(0, 38fr) minmax(350px, 30fr) minmax(0, 32fr); min-height: 0; }
   aside { display: flex; flex-direction: column; overflow: auto; padding: 5px 9px 8px; }
   #left  { grid-column: 1; grid-row: 1 / 4; border-right: 1px solid var(--border); }
-  #right { grid-column: 3; grid-row: 1 / 4; border-left: 1px solid var(--border); }
+  #right { grid-column: 3; grid-row: 2 / 4; margin: 3px 6px 6px 0; border: 1px solid var(--border); background: var(--surface); }
   #stageWrap { grid-column: 2; grid-row: 2; margin: 3px 6px 3px; }
-  #listWrap  { grid-column: 2; grid-row: 1; margin: 6px 6px 3px; display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  #listWrap  { grid-column: 2 / 4; grid-row: 1; margin: 6px 6px 3px; display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
     background: var(--surface); border: 1px solid var(--border); min-height: 0; }
   #cmpWrap   { grid-column: 2; grid-row: 3; margin: 3px 6px 6px; }
 
@@ -263,6 +264,29 @@
   #advice.bad .head b { color: var(--bad); }
   #advice .head { padding: 8px 10px; }
   #advice .head b { font-size: 16px; }
+
+  /* ── 오른쪽 결과 열: 흐름도 + 비교 차트 두 줄 높이를 세 칸이 나눠 채운다 ──
+     병목 설명이 가장 길어서 가장 크게, 추천은 결론 한 줄, 보정은 결과 표가 아래로 쌓인다. */
+  #right .panel { display: flex; flex-direction: column; flex: 1 1 0; }
+  #right .panel:nth-child(1) { flex-grow: 3; }
+  #right .panel:nth-child(2) { flex-grow: 1.2; }
+  #right .panel:nth-child(3) { flex-grow: 2; }
+  #right .panel h2 { font-size: 13px; }
+  #right .panel h2 small { font-size: 10.5px; }
+  #right #bottleneck { flex: 1; display: flex; flex-direction: column; padding: 9px 12px; }
+  #right #bottleneck .t { font-size: 15px; }
+  #right #bottleneck .d { flex: 1; max-height: none; font-size: 12.5px; line-height: 1.55; margin-top: 5px; }
+  #right .tiles { gap: 5px; margin-top: 6px; }
+  #right .tile { padding: 6px 8px; }
+  #right .tile .k { font-size: 10.5px; }
+  #right .tile .v { font-size: 19px; }
+  #right .tile .v small { font-size: 11px; }
+  #right #advice { flex: 1; display: flex; }
+  #right #advice .head { flex: 1; align-items: center; padding: 10px 14px; }
+  #right #advice .head b { font-size: 22px; }
+  #right #advice .head .sub { font-size: 12px; }
+  #right #advice .head .cost { font-size: 18px; }
+  #right #calibOut { flex: 1; min-height: 0; overflow: auto; font-size: 11.5px; }
 </style>
 </head>
 <body>
